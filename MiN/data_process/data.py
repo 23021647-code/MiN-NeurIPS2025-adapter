@@ -152,8 +152,8 @@ class iCUB200(iData):
         self.class_order = np.arange(200).tolist()
 
     def data_initialization(self):
-        train_dir = r'[DATA PATH]'
-        test_dir = r'[DATA PATH]'
+        train_dir =self.args["data_path"]
+        test_dir = self.args["data_path"]
         self.category_index, self.train_data = split_img_label(train_dir)
         self.category_index, self.test_data = split_img_label(test_dir)
 
@@ -238,3 +238,4 @@ def split_img_label(root):
         cat_list.append(sample_list)
         num += 1
     return category_index, cat_list
+
