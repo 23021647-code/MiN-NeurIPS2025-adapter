@@ -1,10 +1,11 @@
 {
     "dataset": "cifar224",
-    "init_class": 20,
-    "increment": 20,
+    "init_class": 5,
+    "increment": 5,
     "img_size": 224,
     "save_all_checkpoint": false,
     "shuffle": true,
     "seed": 1993
 
 }
+
