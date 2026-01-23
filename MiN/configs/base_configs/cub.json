@@ -1,5 +1,6 @@
 {
-    "dataset": "/kaggle/input/cub2002011/CUB_200_2011/images",
+    "dataset": "cub"
+    "data_path": "/kaggle/input/cub2002011/CUB_200_2011/images"
     "init_class": 20,
     "increment": 20,
     "img_size": 224,
@@ -7,4 +8,5 @@
     "shuffle": true,
     "seed": 1993
 }
+
 
