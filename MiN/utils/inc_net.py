@@ -170,12 +170,13 @@ class MiNbaseNet(nn.Module):
             self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
     def forward(self, x, new_forward: bool = False):
-
+        
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
+        if self.training:
+            print("!!! NOISE IS RUNNING !!!")
         # [ADDED] Cast về dtype của weight (thường là FP16 nếu đang autocast)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
@@ -236,3 +237,4 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+
