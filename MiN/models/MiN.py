@@ -90,19 +90,15 @@ class MinNet(object):
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
-        device = self.device
-        with torch.no_grad(), autocast('cuda'):
+        with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(device)
-                
-                # [MODIFIED] Thay model(inputs) bằng logic tìm noise tối ưu
+                inputs = inputs.to(self.device)
                 if self.cur_task > 0:
-                    outputs = model.forward_tuna_selection(inputs)
+                    outputs = model.forward_tuna_combined(inputs)
                 else:
-                    # Task 0 chưa có gì để chọn, chạy mode Universal mặc định
-                    self._network.set_noise_mode(-2)
+                    model.set_noise_mode(-2)
                     outputs = model(inputs)
-
+                
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 correct += (predicts.cpu() == targets).sum()
@@ -368,7 +364,7 @@ class MinNet(object):
                 
                 # [MODIFIED] Logic Selection
                 if self.cur_task > 0:
-                    outputs = model.forward_tuna_selection(inputs)
+                    outputs = model.forward_tuna_combined(inputs)
                 else:
                     self._network.set_noise_mode(-2)
                     outputs = model(inputs)
