@@ -99,7 +99,7 @@ class MinNet(object):
                 
                 # [MODIFIED] Logic suy diễn kết hợp TUNA
                 # Nếu đã học qua Task 0 (tức là có nhiều task để lựa chọn)
-                if self.cur_task > 0 and hasattr(model, 'forward_tuna_combined'):
+                if self.cur_task > 0 and hasattr(model, 'forward_tuna_selection'):
                     outputs = model.forward_tuna_combined(inputs)
                 else:
                     # Task đầu tiên hoặc chưa update inc_net thì chạy như cũ
