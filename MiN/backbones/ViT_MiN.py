@@ -60,73 +60,97 @@ class Noise_weigh(nn.Module):
     def forward(self, x):
         return x * self.weight
 
+
 class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(torch.nn.Linear, self).__init__()
+
         self.bias = None
+
         self.MLP = nn.Linear(in_dim, out_dim)
-        torch.nn.init.constant_(self.MLP.weight, 0); torch.nn.init.constant_(self.MLP.bias, 0)
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
 
         device = torch.device("cuda:{}".format(0))
         factory_kwargs = {"device": device, "dtype": torch.float}
+
         self.hidden_dim = hidden_dim
+
         self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_down)
+
         self.reset_parameters()
 
         self.act = nn.GELU()
+
         self.mu = nn.ModuleList()
         self.sigmma = nn.ModuleList()
+
         self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
-        self.register_buffer("weight_up", self.w_up) # Đổi tên cho đỡ trùng
+        self.register_buffer("weight", self.w_up)
         self.reset_parameters()
 
         self.weight_noise = None
-        # [ADDED] Biến điều khiển: -2 là Universal (Mixture), >=0 là Specific Task
-        self.active_task_idx = -2 
+        self.active_task_idx = -2
 
     def update_noise(self):
-        # Giữ nguyên logic thêm layer mới, khởi tạo về 0 (Zero Init)
+        # [MODIFIED] Luôn khởi tạo Expert mới về 0 (Zero Init)
         self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-        torch.nn.init.constant_(self.mu[-1].weight, 0.); torch.nn.init.constant_(self.mu[-1].bias, 0.)
-        torch.nn.init.constant_(self.sigmma[-1].weight, 0.); torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
-
+        
+        torch.nn.init.constant_(self.mu[-1].weight, 0.)
+        torch.nn.init.constant_(self.mu[-1].bias, 0.)
+        torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+        torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+    
     def init_weight_noise(self, prototypes):
-        # Giữ nguyên logic tính cosine similarity của bạn
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
         else:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
             weight = torch.ones(len(self.mu))
             for i in range(len(prototypes)):
-                mu_t = prototypes[-1]; mu_i = prototypes[i]
-                s_i = torch.dot(mu_t, mu_i) / (torch.norm(mu_t) * torch.norm(mu_i) + 1e-8)
+                mu_t = prototypes[-1]
+                mu_i = prototypes[i]
+                dot_product = torch.dot(mu_t, mu_i)
+                norm_t = torch.norm(mu_t)
+                norm_i = torch.norm(mu_i)
+                s_i = dot_product / (norm_t * norm_i)
                 weight[i] = s_i.detach().clone()
-            self.weight_noise = torch.nn.Parameter(torch.softmax(weight, dim=-1))
+            weight = torch.softmax(weight, dim=-1)
+            self.weight_noise = weight
+            self.weight_noise.requires_grad = True
             
     def unfreeze_noise(self):
-        for param in self.mu[-1].parameters(): param.requires_grad = True
-        for param in self.sigmma[-1].parameters(): param.requires_grad = True
+
+        for param in self.mu[-1].parameters():
+            param.requires_grad = True
+        for param in self.sigmma[-1].parameters():
+            param.requires_grad = True
 
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
-        x_down = hyper_features @ self.weight
-        noise = 0
+        x_down = hyper_features @ self.w_down
+        noise = 0 # [MODIFIED] Khởi tạo noise bằng 0
 
-        # [MODIFIED] Logic chọn bộ Noise
+        # [MODIFIED] Logic rẽ nhánh Hybrid TUNA
         if self.active_task_idx >= 0:
-            # Mode Specific: Chỉ dùng 1 task
+            # Chế độ Specific: Chỉ dùng đúng bộ Expert được chọn
             if self.active_task_idx < len(self.mu):
                 noise = self.mu[self.active_task_idx](x_down) + self.sigmma[self.active_task_idx](x_down)
         else:
-            # Mode Universal: Trộn tất cả (Mixture)
+            # Chế độ Universal (Gộp/Mixture): Trộn tất cả Expert bằng weight_noise
             if self.weight_noise is not None:
+                # Đảm bảo weight_noise sum = 1
                 w = torch.softmax(self.weight_noise, dim=-1)
                 for i in range(len(self.mu)):
                     noise += (self.mu[i](x_down) + self.sigmma[i](x_down)) * w[i]
+            else:
+                # Fallback nếu chưa có weight_noise
+                noise = self.mu[-1](x_down) + self.sigmma[-1](x_down)
 
-        return x1 + (noise @ self.weight_up) + hyper_features
+        noise = noise @ self.w_up
+        return x1 + noise + hyper_features
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
