@@ -246,34 +246,42 @@ class MiNbaseNet(nn.Module):
                 m.active_task_idx = mode
 
     # [ADDED] Logic tìm kết quả tự tin nhất (Max Logit)
-    def forward_tuna_selection(self, x):
+    def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.backbone.noise_maker[0].mu)
         
-        # Các mode cần thử: Universal (-2) và từng Expert riêng lẻ (0 -> num_tasks-1)
-        modes = [-2] + list(range(num_tasks))
-        best_logits = None
-        max_scores = torch.full((batch_size,), -float('inf'), device=x.device)
+        # 1. Lấy Universal Logits (Mode -2)
+        self.set_noise_mode(-2)
+        with torch.no_grad():
+            features_uni = self.backbone(x)
+            logits_uni = self.forward_fc(self.buffer(features_uni))
+
+        # 2. Tìm Best Specific Logits dựa trên ENTROPY
+        best_logits_spec = torch.zeros_like(logits_uni)
+        min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
 
         with torch.no_grad():
-            for m in modes:
-                self.set_noise_mode(m)
-                # Dùng chính forward mặc định của bạn
-                logits = self.forward_fc(self.buffer(self.backbone(x)))
+            for t in range(num_tasks):
+                self.set_noise_mode(t) # Mode Specific
                 
-                # Max Logit Selection: Tìm giá trị score cao nhất
-                curr_max, _ = torch.max(logits, dim=1)
+                # Forward
+                l_t = self.forward_fc(self.buffer(self.backbone(x)))
                 
-                if best_logits is None:
-                    best_logits = logits.clone(); max_scores = curr_max
-                else:
-                    # Nếu mode này tự tin hơn (logit cao hơn), cập nhật cho từng mẫu trong batch
-                    mask = curr_max > max_scores
-                    max_scores[mask] = curr_max[mask]
-                    best_logits[mask] = logits[mask]
+                # Tính Entropy: -sum(p * log(p))
+                prob = torch.softmax(l_t, dim=1)
+                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                
+                # Nếu entropy thấp hơn (tự tin hơn) -> Chọn task này
+                mask = entropy < min_entropy
+                min_entropy[mask] = entropy[mask]
+                best_logits_spec[mask] = l_t[mask]
+
+        # 3. Cộng gộp kết quả: Universal + Best Specific
+        final_logits = logits_uni + best_logits_spec
 
         self.set_noise_mode(-2) # Reset về mặc định
         if was_training: self.train()
-        return {'logits': best_logits}
+        
+        return {'logits': final_logits}
