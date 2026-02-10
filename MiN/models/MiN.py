@@ -87,62 +87,27 @@ class MinNet(object):
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
-    def compute_test_acc(self, test_loader):
+   def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
-        
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
                 
-                # [HYBRID STRATEGY] 
-                # Nếu có từ 2 task trở lên, dùng cơ chế Selection (TUNA style)
+                # [MODIFIED] Thay model(inputs) bằng logic tìm noise tối ưu
                 if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
+                    outputs = model.forward_tuna_selection(inputs)
                 else:
-                    # Task đầu tiên chạy mode Universal mặc định
-                    model.set_noise_mode(-2)
+                    # Task 0 chưa có gì để chọn, chạy mode Universal mặc định
+                    self._network.set_noise_mode(-2)
                     outputs = model(inputs)
 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 correct += (predicts.cpu() == targets).sum()
                 total += len(targets)
-        
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
-    def eval_task(self, test_loader):
-        model = self._network.eval()
-        pred, label = [], []
-        
-        with torch.no_grad(), autocast('cuda'):
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                
-                if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
-                else:
-                    model.set_noise_mode(-2)
-                    outputs = model(inputs)
-
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                
-                pred.extend([int(p.cpu().numpy()) for p in predicts])
-                label.extend([int(t.cpu().numpy()) for t in targets])
-        
-        class_info = calculate_class_metrics(pred, label)
-        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
-        
-        return {
-            "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
-        }
 
     @staticmethod
     def cat2order(targets, datamanger):
@@ -320,81 +285,113 @@ class MinNet(object):
 
         for param in self._network.parameters():
             param.requires_grad = False
-        
-        # Mở khóa Classifier
         for param in self._network.normal_fc.parameters():
             param.requires_grad = True
             
-        # Mở khóa bộ Expert Noise của task này (Reset logic đã nằm trong update_noise)
         if self.cur_task == 0:
             self._network.init_unfreeze()
         else:
             self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, self.lr, self.weight_decay)
+        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-        
-        self._network.train()
-        self._network.to(self.device)
-        
-        # [STRATEGY] Khi train, ta luôn dùng mode Universal (-2) để noise mới
-        # học cách đóng góp vào kiến thức chung của toàn bộ Experts.
-        self._network.set_noise_mode(-2)
 
         prog_bar = tqdm(range(epochs))
+        self._network.train()
+        self._network.to(self.device)
+        self._network.set_noise_mode(-2)
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+                
+                # [ADDED] set_to_none=True tiết kiệm RAM hơn
                 optimizer.zero_grad(set_to_none=True) 
 
+                # [ADDED] Autocast để giảm 50% VRAM khi train
                 with autocast('cuda'):
-                    # Forward qua network
                     if self.cur_task > 0:
-                        # Kết hợp kết quả cũ (đóng băng) + mới
                         with torch.no_grad():
-                            # Chạy backbone với Universal Noise
-                            outputs_old = self._network(inputs)
-                            logits_old = outputs_old['logits']
-                        
-                        # Chạy nhánh classifier mới
-                        outputs_new = self._network.forward_normal_fc(inputs)
-                        logits_new = outputs_new['logits']
-                        logits = logits_old + logits_new
+                            outputs1 = self._network(inputs, new_forward=False)
+                            logits1 = outputs1['logits']
+                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits2 = outputs2['logits']
+                        logits2 = logits2 + logits1
+                        loss = F.cross_entropy(logits2, targets.long())
+                        logits_final = logits2
                     else:
-                        outputs = self._network.forward_normal_fc(inputs)
+                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits = outputs["logits"]
+                        loss = F.cross_entropy(logits, targets.long())
+                        logits_final = logits
 
-                    loss = F.cross_entropy(logits, targets.long())
-
-                # Backward với GradScaler
+                # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
                 losses += loss.item()
-                _, preds = torch.max(logits, dim=1)
+
+                _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                del inputs, targets, loss, logits # Dọn dẹp biến tạm ngay lập tức
+                # [ADDED] Xóa biến tạm
+                del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} | Ep {}/{} | Loss {:.3f} | Train Acc {:.2f}%".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc
+            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
+                self.cur_task,
+                epoch + 1,
+                epochs,
+                losses / len(train_loader),
+                train_acc,
             )
+            self.logger.info(info)
             prog_bar.set_description(info)
-
-            # Dọn Cache mỗi 5 epoch
-            if (epoch + 1) % 5 == 0:
+            
+            # [ADDED] Clear cache sau mỗi epoch
+            if epoch % 5 == 0:
                 self._clear_gpu()
 
-    
+    def eval_task(self, test_loader):
+        model = self._network.eval()
+        pred, label = [], []
+        with torch.no_grad(), autocast('cuda'):
+            for i, (_, inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(self.device)
+                
+                # [MODIFIED] Logic Selection
+                if self.cur_task > 0:
+                    outputs = model.forward_tuna_selection(inputs)
+                else:
+                    self._network.set_noise_mode(-2)
+                    outputs = model(inputs)
+
+                logits = outputs["logits"]
+                predicts = torch.max(logits, dim=1)[1]
+                pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
+                label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
+        
+        class_info = calculate_class_metrics(pred, label)
+        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        return {
+            "all_class_accy": class_info['all_accy'],
+            "class_accy": class_info['class_accy'],
+            "class_confusion": class_info['class_confusion_matrices'],
+            "task_accy": task_info['all_accy'],
+            "task_confusion": task_info['task_confusion_matrices'],
+            "all_task_accy": task_info['task_accy'],
+        }
+    # =========================================================================
+    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
+    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
+    # =========================================================================
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
