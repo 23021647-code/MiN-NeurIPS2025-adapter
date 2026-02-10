@@ -91,6 +91,7 @@ class PiNoise(torch.nn.Linear):
         self.reset_parameters()
 
         self.weight_noise = None
+        self.active_task_index = None
 
     def update_noise(self):
 
@@ -133,24 +134,45 @@ class PiNoise(torch.nn.Linear):
             param.requires_grad = True
         for param in self.sigmma[-1].parameters():
             param.requires_grad = True
-
+    def set_active_task(self, task_idx=None):
+        """
+        Nếu task_idx là None: Chạy chế độ MIN gốc (trộn nhiễu).
+        Nếu task_idx là int: Chỉ chạy nhiễu của task đó (Chế độ TUNA).
+        """
+        self.active_task_index = task_idx
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
-
         x_down = hyper_features @ self.w_down
-
         noise = None
 
-        for i in range(len(self.mu)):
-            mu = self.mu[i](x_down)
-            sigmma = self.sigmma[i](x_down)
-            if noise is None:
-                noise = (mu + sigmma) * self.weight_noise[i]
+        # [MODIFIED] Logic Forward hỗ trợ cả MIN và TUNA Selection
+        if self.active_task_index is not None:
+            # --- CHẾ ĐỘ TUNA SELECTION ---
+            # Chỉ lấy nhiễu của đúng task đang xét
+            idx = self.active_task_index
+            if idx < len(self.mu): # Kiểm tra index hợp lệ
+                mu = self.mu[idx](x_down)
+                sigmma = self.sigmma[idx](x_down)
+                # Lưu ý: Khi select 1 task, ta không nhân với weight_noise (trọng số trộn)
+                # Hoặc có thể nhân với 1.0, tùy chiến lược. Ở đây ta lấy raw noise.
+                noise = (mu + sigmma) 
             else:
-                noise += (mu + sigmma) * self.weight_noise[i]
+                # Nếu index vượt quá (ví dụ chưa train đến), không cộng nhiễu
+                noise = torch.zeros_like(x1)
+        else:
+            # --- CHẾ ĐỘ MIN GỐC (MIXTURE) ---
+            for i in range(len(self.mu)):
+                mu = self.mu[i](x_down)
+                sigmma = self.sigmma[i](x_down)
+                if noise is None:
+                    noise = (mu + sigmma) * self.weight_noise[i]
+                else:
+                    noise += (mu + sigmma) * self.weight_noise[i]
 
+        if noise is None:
+             noise = torch.zeros_like(x1)
+             
         noise = noise @ self.w_up
-
         return x1 + noise + hyper_features
 
     def forward_new(self, hyper_features):
