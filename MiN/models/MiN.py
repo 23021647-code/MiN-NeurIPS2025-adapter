@@ -91,15 +91,25 @@ class MinNet(object):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
+        
         # [MODIFIED] Thêm no_grad và autocast để test nhanh và nhẹ hơn
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
-                outputs = model(inputs)
+                
+                # [MODIFIED] Logic suy diễn kết hợp TUNA
+                # Nếu đã học qua Task 0 (tức là có nhiều task để lựa chọn)
+                if self.cur_task > 0 and hasattr(model, 'forward_tuna_combined'):
+                    outputs = model.forward_tuna_combined(inputs)
+                else:
+                    # Task đầu tiên hoặc chưa update inc_net thì chạy như cũ
+                    outputs = model(inputs)
+
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 correct += (predicts.cpu() == targets).sum()
                 total += len(targets)
+        
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     @staticmethod
@@ -353,18 +363,27 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
+        
         # [ADDED] no_grad
-        with torch.no_grad():
+        with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
                 
-                outputs = model(inputs)
+                # [MODIFIED] Logic suy diễn kết hợp TUNA
+                if self.cur_task > 0 and hasattr(model, 'forward_tuna_combined'):
+                    outputs = model.forward_tuna_combined(inputs)
+                else:
+                    outputs = model(inputs)
+
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
+                
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
                 label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
+        
         class_info = calculate_class_metrics(pred, label)
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        
         return {
             "all_class_accy": class_info['all_accy'],
             "class_accy": class_info['class_accy'],
@@ -373,7 +392,6 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
     # =========================================================================
     # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
     # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
