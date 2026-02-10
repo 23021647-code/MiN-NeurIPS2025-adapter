@@ -237,4 +237,67 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+    def set_noise_task(self, task_idx):
+        # Duyệt qua các layer của backbone để set index
+        # Giả định backbone là ViT và có thuộc tính noise_maker (như trong hàm update_noise cũ của bạn)
+        if hasattr(self.backbone, 'noise_maker'):
+             for j in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[j].set_active_task(task_idx)
+
+    # [ADDED] Hàm suy diễn theo phong cách TUNA (Entropy Selection)
+    def forward_tuna_selection(self, x):
+        """
+        Thực hiện forward T lần (với T là số task hiện tại).
+        Chọn kết quả có Entropy thấp nhất.
+        """
+        # Lưu lại trạng thái training
+        was_training = self.training
+        self.eval()
+
+        batch_size = x.shape[0]
+        num_tasks = len(self.task_prototypes) # Số lượng task đã học (hoặc lấy từ self.cur_task + 1)
+        
+        best_logits = None
+        min_entropies = torch.full((batch_size,), float('inf'), device=x.device)
+
+        # 1. Vòng lặp qua từng Task (Mỗi task là một "Chuyên gia")
+        for t in range(num_tasks):
+            # Kích hoạt bộ nhiễu của riêng task t
+            self.set_noise_task(t)
+            
+            with torch.no_grad():
+                # Chạy forward backbone với nhiễu của task t
+                hyper_features = self.backbone(x)
+                hyper_features = hyper_features.to(self.weight.dtype)
+                
+                # Forward qua Classifier (Buffer + Linear)
+                # Lưu ý: Logic này dùng chung 1 classifier lớn cuối cùng
+                logits = self.forward_fc(self.buffer(hyper_features))
+                
+                # Tính Entropy: H(x) = - sum(p(x) * log(p(x)))
+                probs = torch.softmax(logits, dim=1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1) # [Batch_size]
+
+            # 2. Cơ chế Selection (Chọn task có entropy thấp nhất cho từng ảnh)
+            if best_logits is None:
+                best_logits = logits
+                min_entropies = entropy
+            else:
+                # Mask những mẫu mà task t tự tin hơn (entropy thấp hơn) task trước đó
+                better_mask = entropy < min_entropies
+                
+                # Cập nhật min entropy
+                min_entropies[better_mask] = entropy[better_mask]
+                
+                # Cập nhật logits cho những mẫu tốt hơn
+                best_logits[better_mask] = logits[better_mask]
+
+        # 3. Reset về chế độ mặc định (Mixture) để không ảnh hưởng code training
+        self.set_noise_task(None) 
+        self.train(was_training)
+
+        return {
+            'logits': best_logits
+        }
+
 
