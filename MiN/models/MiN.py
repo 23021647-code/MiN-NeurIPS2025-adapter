@@ -87,7 +87,7 @@ class MinNet(object):
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
-   def compute_test_acc(self, test_loader):
+    def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
