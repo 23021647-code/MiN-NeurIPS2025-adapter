@@ -91,48 +91,54 @@ class PiNoise(torch.nn.Linear):
         self.reset_parameters()
 
         self.weight_noise = None
-        self.active_task_index = None
+        # active_task_idx điều khiển chế độ inference:
+        # -2: Universal Mode (Trộn tất cả theo weight_noise)
+        # >=0: Specific Mode (Chỉ dùng noise của đúng Task idx đó)
+        # -1: None Mode (Không cộng noise)
+        self.active_task_idx = -2
 
     def update_noise(self):
 
-        if len(self.mu) == 0:
-            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.mu[0].weight, 0.)
-            torch.nn.init.constant_(self.mu[0].bias, 0.)
-            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.sigmma[0].weight, 0.)
-            torch.nn.init.constant_(self.sigmma[0].bias, 0.)
-        else:
-            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.mu[-1].weight, 0.)
-            torch.nn.init.constant_(self.mu[-1].bias, 0.)
-            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
-            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+        new_mu = nn.Linear(self.hidden_dim, self.hidden_dim)
+        new_sigma = nn.Linear(self.hidden_dim, self.hidden_dim)
+        
+        # [QUAN TRỌNG] Khởi tạo về 0 để ban đầu noise = 0, tránh làm sốc backbone
+        torch.nn.init.zeros_(new_mu.weight)
+        torch.nn.init.zeros_(new_mu.bias)
+        torch.nn.init.zeros_(new_sigma.weight)
+        torch.nn.init.zeros_(new_sigma.bias)
+
+        self.mu.append(new_mu)
+        self.sigmma.append(new_sigma)
     
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
         else:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
             weight = torch.ones(len(self.mu))
+            mu_t = prototypes[-1] # Prototype task hiện tại
             for i in range(len(prototypes)):
-                mu_t = prototypes[-1]
                 mu_i = prototypes[i]
-                dot_product = torch.dot(mu_t, mu_i)
-                norm_t = torch.norm(mu_t)
-                norm_i = torch.norm(mu_i)
-                s_i = dot_product / (norm_t * norm_i)
+                # Cosine Similarity
+                s_i = torch.dot(mu_t, mu_i) / (torch.norm(mu_t) * torch.norm(mu_i) + 1e-8)
                 weight[i] = s_i.detach().clone()
-            weight = torch.softmax(weight, dim=-1)
-            self.weight_noise = weight
-            self.weight_noise.requires_grad = True
+            
+            # Normalize trọng số bằng Softmax
+            self.weight_noise = torch.nn.Parameter(torch.softmax(weight, dim=-1))
             
     def unfreeze_noise(self):
-
+        # Đóng băng tất cả
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        # Mở khóa Expert cuối cùng
         for param in self.mu[-1].parameters():
             param.requires_grad = True
         for param in self.sigmma[-1].parameters():
+            param.requires_grad = True
+        
+        # Mở khóa MLP chính để tinh chỉnh đặc trưng
+        for param in self.MLP.parameters():
             param.requires_grad = True
     def set_active_task(self, task_idx=None):
         """
@@ -141,39 +147,38 @@ class PiNoise(torch.nn.Linear):
         """
         self.active_task_index = task_idx
     def forward(self, hyper_features):
+        # 1. Nhánh MLP song song
         x1 = self.MLP(hyper_features)
-        x_down = hyper_features @ self.w_down
-        noise = None
 
-        # [MODIFIED] Logic Forward hỗ trợ cả MIN và TUNA Selection
-        if self.active_task_index is not None:
-            # --- CHẾ ĐỘ TUNA SELECTION ---
-            # Chỉ lấy nhiễu của đúng task đang xét
-            idx = self.active_task_index
-            if idx < len(self.mu): # Kiểm tra index hợp lệ
-                mu = self.mu[idx](x_down)
-                sigmma = self.sigmma[idx](x_down)
-                # Lưu ý: Khi select 1 task, ta không nhân với weight_noise (trọng số trộn)
-                # Hoặc có thể nhân với 1.0, tùy chiến lược. Ở đây ta lấy raw noise.
-                noise = (mu + sigmma) 
+        # 2. Nhánh Noise
+        x_down = hyper_features @ self.weight_down
+        noise_out = 0
+
+        if self.active_task_idx >= 0:
+            # --- CHẾ ĐỘ SPECIFIC (Task riêng lẻ) ---
+            # Dùng cho bước Selection của TUNA
+            idx = self.active_task_idx
+            if idx < len(self.mu):
+                noise_out = self.mu[idx](x_down) + self.sigmma[idx](x_down)
+        
+        elif self.active_task_idx == -2:
+            # --- CHẾ ĐỘ UNIVERSAL (Gộp tất cả) ---
+            # Trộn các experts dựa trên trọng số đã học
+            if self.weight_noise is not None:
+                # Đảm bảo weight_noise luôn sum = 1
+                w = torch.softmax(self.weight_noise, dim=-1)
+                for i in range(len(self.mu)):
+                    expert_noise = self.mu[i](x_down) + self.sigmma[i](x_down)
+                    noise_out += expert_noise * w[i]
             else:
-                # Nếu index vượt quá (ví dụ chưa train đến), không cộng nhiễu
-                noise = torch.zeros_like(x1)
-        else:
-            # --- CHẾ ĐỘ MIN GỐC (MIXTURE) ---
-            for i in range(len(self.mu)):
-                mu = self.mu[i](x_down)
-                sigmma = self.sigmma[i](x_down)
-                if noise is None:
-                    noise = (mu + sigmma) * self.weight_noise[i]
-                else:
-                    noise += (mu + sigmma) * self.weight_noise[i]
+                # Nếu chưa có trọng số, mặc định lấy expert cuối
+                noise_out = self.mu[-1](x_down) + self.sigmma[-1](x_down)
 
-        if noise is None:
-             noise = torch.zeros_like(x1)
-             
-        noise = noise @ self.w_up
-        return x1 + noise + hyper_features
+        # 3. Kết hợp và cộng Residual
+        # Đầu ra = MLP(x) + Noise_Module(x) + x
+        final_noise = noise_out @ self.weight_up
+        
+        return x1 + final_noise + hyper_features
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
