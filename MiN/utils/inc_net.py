@@ -168,7 +168,16 @@ class MiNbaseNet(nn.Module):
             
             self.R -= self.R @ X.T @ K @ X @ self.R
             self.weight += self.R @ X.T @ (Y - X @ self.weight)
-
+    def set_noise_mode(self, mode):
+        """
+        Thiết lập chế độ hoạt động cho tất cả các PiNoise layer trong backbone
+        mode = -2: Universal (Gộp)
+        mode >= 0: Specific (Task ID)
+        """
+        if hasattr(self.backbone, 'noise_maker'):
+            for m in self.backbone.noise_maker:
+                m.active_task_idx = mode
+    
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
@@ -217,12 +226,63 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
+    def forward_tuna_combined(self, x):
+        """
+        Duyệt qua nhánh Universal và các nhánh Specific.
+        Chọn kết quả nào có Logit lớn nhất (tự tin nhất).
+        """
+        was_training = self.training
+        self.eval() 
+        
+        batch_size = x.shape[0]
+        # Số lượng Task đã học (dựa vào số lượng Experts trong PiNoise layer đầu tiên)
+        num_tasks = len(self.backbone.noise_maker[0].mu)
+
+        # Các chế độ cần thử: -2 (Universal) và 0...N (Specific)
+        modes = [-2] + list(range(num_tasks))
+        
+        best_logits = None
+        max_values = torch.full((batch_size,), -float('inf'), device=x.device)
+
+        with torch.no_grad():
+            for mode in modes:
+                # 1. Bật mode noise tương ứng
+                self.set_noise_mode(mode)
+                
+                # 2. Forward qua Backbone + Unified Classifier
+                # Lưu ý: Ta dùng forward_fc kết hợp với buffer(backbone(x)) 
+                # để dùng chung một "Hội đồng trọng số" duy nhất.
+                features = self.backbone(x)
+                logits = self.forward_fc(self.buffer(features))
+                
+                # 3. Max Logit Selection: Tìm giá trị lớn nhất trong các class dự đoán
+                # current_max: độ lớn của logit cao nhất, _ : index của class đó
+                current_max, _ = torch.max(logits, dim=1)
+                
+                if best_logits is None:
+                    best_logits = logits.clone()
+                    max_values = current_max
+                else:
+                    # So sánh: Nếu mode hiện tại cho logit cao hơn mode cũ cho từng mẫu trong batch
+                    better_mask = current_max > max_values
+                    
+                    # Cập nhật giá trị max và logits tốt nhất
+                    max_values[better_mask] = current_max[better_mask]
+                    best_logits[better_mask] = logits[better_mask]
+
+        # Reset backbone về chế độ mặc định (Universal) để không lỗi các bước sau
+        self.set_noise_mode(-2)
+        if was_training: self.train()
+        
+        return {'logits': best_logits}
 
     def update_noise(self):
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
-            self.backbone.noise_maker[j].init_weight_noise(self.task_prototypes)
-
+        """Gọi hàm tạo thêm bộ noise expert mới cho task mới"""
+        if hasattr(self.backbone, 'noise_maker'):
+            for m in self.backbone.noise_maker:
+                m.update_noise()
+                # Khởi tạo trọng số trộn (alphas) cho nhánh Universal
+                m.init_weight_noise(self.task_prototypes)
     def unfreeze_noise(self):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].unfreeze_noise()
@@ -237,67 +297,3 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
-    def set_noise_task(self, task_idx):
-        # Duyệt qua các layer của backbone để set index
-        # Giả định backbone là ViT và có thuộc tính noise_maker (như trong hàm update_noise cũ của bạn)
-        if hasattr(self.backbone, 'noise_maker'):
-             for j in range(len(self.backbone.noise_maker)):
-                self.backbone.noise_maker[j].set_active_task(task_idx)
-
-    # [ADDED] Hàm suy diễn theo phong cách TUNA (Entropy Selection)
-    def forward_tuna_selection(self, x):
-        """
-        Thực hiện forward T lần (với T là số task hiện tại).
-        Chọn kết quả có Entropy thấp nhất.
-        """
-        # Lưu lại trạng thái training
-        was_training = self.training
-        self.eval()
-
-        batch_size = x.shape[0]
-        num_tasks = len(self.task_prototypes) # Số lượng task đã học (hoặc lấy từ self.cur_task + 1)
-        
-        best_logits = None
-        min_entropies = torch.full((batch_size,), float('inf'), device=x.device)
-
-        # 1. Vòng lặp qua từng Task (Mỗi task là một "Chuyên gia")
-        for t in range(num_tasks):
-            # Kích hoạt bộ nhiễu của riêng task t
-            self.set_noise_task(t)
-            
-            with torch.no_grad():
-                # Chạy forward backbone với nhiễu của task t
-                hyper_features = self.backbone(x)
-                hyper_features = hyper_features.to(self.weight.dtype)
-                
-                # Forward qua Classifier (Buffer + Linear)
-                # Lưu ý: Logic này dùng chung 1 classifier lớn cuối cùng
-                logits = self.forward_fc(self.buffer(hyper_features))
-                
-                # Tính Entropy: H(x) = - sum(p(x) * log(p(x)))
-                probs = torch.softmax(logits, dim=1)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1) # [Batch_size]
-
-            # 2. Cơ chế Selection (Chọn task có entropy thấp nhất cho từng ảnh)
-            if best_logits is None:
-                best_logits = logits
-                min_entropies = entropy
-            else:
-                # Mask những mẫu mà task t tự tin hơn (entropy thấp hơn) task trước đó
-                better_mask = entropy < min_entropies
-                
-                # Cập nhật min entropy
-                min_entropies[better_mask] = entropy[better_mask]
-                
-                # Cập nhật logits cho những mẫu tốt hơn
-                best_logits[better_mask] = logits[better_mask]
-
-        # 3. Reset về chế độ mặc định (Mixture) để không ảnh hưởng code training
-        self.set_noise_task(None) 
-        self.train(was_training)
-
-        return {
-            'logits': best_logits
-        }
-
-
