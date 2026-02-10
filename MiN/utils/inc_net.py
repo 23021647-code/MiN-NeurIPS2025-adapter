@@ -279,9 +279,10 @@ class MiNbaseNet(nn.Module):
                 best_logits_spec[mask] = l_t[mask]
 
         # 3. Cộng gộp kết quả: Universal + Best Specific
-        final_logits = logits_uni + best_logits_spec
-
+        #final_logits = logits_uni + best_logits_spec
+        final_logits = best_logits_spec
         self.set_noise_mode(-2) # Reset về mặc định
         if was_training: self.train()
         
         return {'logits': final_logits}
+
