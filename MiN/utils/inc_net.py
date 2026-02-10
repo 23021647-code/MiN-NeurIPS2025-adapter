@@ -168,16 +168,7 @@ class MiNbaseNet(nn.Module):
             
             self.R -= self.R @ X.T @ K @ X @ self.R
             self.weight += self.R @ X.T @ (Y - X @ self.weight)
-    def set_noise_mode(self, mode):
-        """
-        Thiết lập chế độ hoạt động cho tất cả các PiNoise layer trong backbone
-        mode = -2: Universal (Gộp)
-        mode >= 0: Specific (Task ID)
-        """
-        if hasattr(self.backbone, 'noise_maker'):
-            for m in self.backbone.noise_maker:
-                m.active_task_idx = mode
-    
+  
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
@@ -226,54 +217,37 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
-    def forward_tuna_combined(self, x):
-        """
-        Duyệt qua nhánh Universal và các nhánh Specific.
-        Chọn kết quả nào có Logit lớn nhất (tự tin nhất).
-        """
-        was_training = self.training
-        self.eval() 
-        
-        batch_size = x.shape[0]
-        # Số lượng Task đã học (dựa vào số lượng Experts trong PiNoise layer đầu tiên)
-        num_tasks = len(self.backbone.noise_maker[0].mu)
+    def set_noise_mode(self, mode):
+        if hasattr(self.backbone, 'noise_maker'):
+            for m in self.backbone.noise_maker:
+                m.active_task_idx = mode
 
-        # Các chế độ cần thử: -2 (Universal) và 0...N (Specific)
-        modes = [-2] + list(range(num_tasks))
+    # [ADDED] Logic tìm kết quả tự tin nhất
+    def forward_tuna_selection(self, x):
+        was_training = self.training
+        self.eval()
+        batch_size = x.shape[0]
+        num_tasks = len(self.backbone.noise_maker[0].mu)
         
+        modes = [-2] + list(range(num_tasks)) # Universal + các Specific
         best_logits = None
-        max_values = torch.full((batch_size,), -float('inf'), device=x.device)
+        max_scores = torch.full((batch_size,), -float('inf'), device=x.device)
 
         with torch.no_grad():
-            for mode in modes:
-                # 1. Bật mode noise tương ứng
-                self.set_noise_mode(mode)
+            for m in modes:
+                self.set_noise_mode(m)
+                # Dùng chính logic forward classifier của bạn
+                logits = self.forward_fc(self.buffer(self.backbone(x)))
                 
-                # 2. Forward qua Backbone + Unified Classifier
-                # Lưu ý: Ta dùng forward_fc kết hợp với buffer(backbone(x)) 
-                # để dùng chung một "Hội đồng trọng số" duy nhất.
-                features = self.backbone(x)
-                logits = self.forward_fc(self.buffer(features))
-                
-                # 3. Max Logit Selection: Tìm giá trị lớn nhất trong các class dự đoán
-                # current_max: độ lớn của logit cao nhất, _ : index của class đó
-                current_max, _ = torch.max(logits, dim=1)
-                
+                curr_max, _ = torch.max(logits, dim=1)
                 if best_logits is None:
-                    best_logits = logits.clone()
-                    max_values = current_max
+                    best_logits = logits.clone(); max_scores = curr_max
                 else:
-                    # So sánh: Nếu mode hiện tại cho logit cao hơn mode cũ cho từng mẫu trong batch
-                    better_mask = current_max > max_values
-                    
-                    # Cập nhật giá trị max và logits tốt nhất
-                    max_values[better_mask] = current_max[better_mask]
-                    best_logits[better_mask] = logits[better_mask]
+                    mask = curr_max > max_scores
+                    max_scores[mask] = curr_max[mask]
+                    best_logits[mask] = logits[mask]
 
-        # Reset backbone về chế độ mặc định (Universal) để không lỗi các bước sau
-        self.set_noise_mode(-2)
-        if was_training: self.train()
-        
+        self.set_noise_mode(-2); self.train(was_training)
         return {'logits': best_logits}
 
     def update_noise(self):
@@ -297,3 +271,4 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+
