@@ -201,47 +201,85 @@ class MinNet(object):
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        
-        # RESET R SPEC ĐỂ HỌC LẠI TỪ ĐẦU (INDEPENDENT)
         self._network.reset_R_spec()
-        
-        prog_bar = tqdm(range(self.fit_epoch)) 
-        for _, epoch in enumerate(prog_bar):
-            # Fit cả 2 nhánh trong 1 loop
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-                
-                # Fit Spec
-                self._network.set_noise_mode(self.cur_task)
-                self._network.fit_spec(inputs, targets)
 
-                # Fit Uni
-                self._network.set_noise_mode(-2)
-                self._network.fit_uni(inputs, targets)
+        # --- BƯỚC 1: TRÍCH XUẤT FEATURE 1 LẦN DUY NHẤT ---
+        print(">>> Fast Fitting: Extracting features once...")
+        all_feats = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for _, inputs, targets in tqdm(train_loader, desc="Caching features"):
+                inputs = inputs.to(self.device)
+                # Chạy qua Backbone + Buffer đúng 1 lần
+                # Lưu ý: fit_fc chạy trước Run nên Noise mode thường là 0 hoặc -2
+                feat = self._network.extract_feature(inputs) 
+                all_feats.append(feat.cpu()) # Đẩy về CPU để tránh OOM GPU
+                all_targets.append(targets.cpu())
+
+        all_feats = torch.cat(all_feats, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+
+        # --- BƯỚC 2: CHẠY RLS TRÊN TẬP FEATURE ĐÃ LƯU ---
+        num_samples = all_feats.shape[0]
+        # Thường RLS chỉ cần 1 epoch là đủ hội tụ
+        for epoch in range(self.fit_epoch):
+            # Shuffle indices để học khách quan hơn
+            indices = torch.randperm(num_samples)
             
-            self._clear_gpu()
-            info = "Task {} --> Dual RLS Fit (Fast)!".format(self.cur_task)
-            self.logger.info(info)
-            prog_bar.set_description(info)
+            for start_idx in range(0, num_samples, self.buffer_batch):
+                end_idx = min(start_idx + self.buffer_batch, num_samples)
+                batch_indices = indices[start_idx:end_idx]
+                
+                # Đưa mini-batch feature trở lại GPU
+                f_batch = all_feats[batch_indices].to(self.device)
+                t_batch = all_targets[batch_indices].to(self.device)
+                y_onehot = torch.nn.functional.one_hot(t_batch, num_classes=self._network.known_class)
+
+                # FIT TRỰC TIẾP (Cần hàm fit_spec_direct trong inc_net.py)
+                self._network.set_noise_mode(self.cur_task)
+                self._network.fit_spec_direct(f_batch, y_onehot)
+
+                self._network.set_noise_mode(-2)
+                self._network.fit_uni_direct(f_batch, y_onehot)
+
+        self._clear_gpu()
+        print(f">>> Task {self.cur_task} --> Fast Fit FC Done!")
 
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        
         self._network.reset_R_spec()
+
+        print(">>> Fast Refitting: Extracting clean features...")
+        all_feats = []
+        all_targets = []
         
-        prog_bar = tqdm(train_loader, desc=f"Refit Dual RLS")
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-            
+        with torch.no_grad():
+            for _, inputs, targets in tqdm(train_loader, desc="Caching clean features"):
+                feat = self._network.extract_feature(inputs.to(self.device))
+                all_feats.append(feat.cpu())
+                all_targets.append(targets.cpu())
+
+        all_feats = torch.cat(all_feats, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+
+        num_samples = all_feats.shape[0]
+        # Re-fit thường chỉ cần 1 lượt qua dữ liệu
+        indices = torch.arange(num_samples)
+        
+        for start_idx in range(0, num_samples, self.buffer_batch):
+            end_idx = min(start_idx + self.buffer_batch, num_samples)
+            f_batch = all_feats[indices[start_idx:end_idx]].to(self.device)
+            t_batch = all_targets[indices[start_idx:end_idx]].to(self.device)
+            y_onehot = torch.nn.functional.one_hot(t_batch, num_classes=self._network.known_class)
+
             self._network.set_noise_mode(self.cur_task)
-            self._network.fit_spec(inputs, targets)
+            self._network.fit_spec_direct(f_batch, y_onehot)
 
             self._network.set_noise_mode(-2)
-            self._network.fit_uni(inputs, targets)
-        
+            self._network.fit_uni_direct(f_batch, y_onehot)
+
         self._clear_gpu()
 
     def run(self, train_loader):
