@@ -203,18 +203,32 @@ class MiNbaseNet(nn.Module):
         with autocast(enabled=False):
             X = self.buffer(self.backbone(X)).float()
             Y = Y.float()
-            if Y.shape[1] < self.fc_spec.out_features:
-                tail = torch.zeros((Y.shape[0], self.fc_spec.out_features - Y.shape[1])).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
-                
-            self.R_spec = self._fit_RLS_batch(X, Y, self.fc_spec, self.R_spec)
+    
+            task_idxs = self.task_class_indices[self.cur_task]
+            Y_task = Y[:, task_idxs]                 # [B, C_task]
+            W_task = self.fc_spec.weight.data[task_idxs, :]  # [C_task, D]
+    
+            # --- RLS đúng công thức nhưng chỉ trên block ---
+            # K = (I + X R X^T)^-1
+            term = torch.eye(feat.shape[0], device=feat.device) + feat @ self.R_spec @ feat.T
+            K = torch.linalg.solve(term, torch.eye(term.shape[0], device=term.device))
+
+    
+            # Update R_spec (reset R trước task rồi thì OK)
+            self.R_spec = self.R_spec - (self.R_spec @ X.T @ K @ X @ self.R_spec)
+    
+            # Update chỉ block hiện tại
+            error = Y_task - X @ W_task.T            # [B, C_task]
+            delta_W = self.R_spec @ X.T @ error      # [D, C_task]
+    
+            self.fc_spec.weight.data[task_idxs, :] = W_task + delta_W.T
 
     def forward_normal_fc(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
         out = self.normal_fc(self.buffer(hyper_features))
         return out
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return self.forward_tuna_combined(x)
 
     # --- HYBRID INFERENCE (Giữ nguyên logic chuẩn trước đó) ---
@@ -312,3 +326,4 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         for p in self.backbone.norm.parameters(): p.requires_grad = True
+
