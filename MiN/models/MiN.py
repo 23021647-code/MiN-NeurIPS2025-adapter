@@ -181,7 +181,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-
+        self._network.set_noise_mode(-2)
         self.fit_fc(train_loader, test_loader)
 
         self._network.update_fc(self.increment)
@@ -213,7 +213,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-
+        self._network.set_noise_mode(self.cur_task)
         self.re_fit(train_loader, test_loader)
 
         del train_set, test_set
@@ -285,7 +285,7 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        self._network.set_noise_mode(-2)
+        self._network.set_noise_mode(self.cur_task)
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
