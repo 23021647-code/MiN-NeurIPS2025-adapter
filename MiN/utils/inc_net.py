@@ -282,9 +282,10 @@ class MiNbaseNet(nn.Module):
 
         # 3. Cộng gộp
         #final_logits = logits_uni + best_logits_spec
-        final_logits = logits_uni 
+        final_logits = best_logits_spec
         self.set_noise_mode(-2)
         if was_training: self.train()
         
         return {'logits': final_logits}
+
 
