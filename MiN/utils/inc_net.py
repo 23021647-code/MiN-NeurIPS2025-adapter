@@ -101,9 +101,11 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-
+    
         self.fc2 = nn.ModuleList()
-
+        self.fc_uni = None
+        self.fc_spec = None
+        self.task_class_indices = {}
     # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
     def set_grad_checkpointing(self, enable=True):
         if hasattr(self.backbone, 'set_grad_checkpointing'):
@@ -128,6 +130,11 @@ class MiNbaseNet(nn.Module):
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
+        self.task_class_indices[self.cur_task] = list(range(start_class, self.known_class))
+
+        # [MODIFIED] Cập nhật kích thước cho CẢ 2 Classifier
+        self.fc_uni = self.generate_fc(self.buffer_size, self.known_class, self.fc_uni)
+        self.fc_spec = self.generate_fc(self.buffer_size, self.known_class, self.fc_spec)
         if self.cur_task > 0:
             fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
@@ -238,6 +245,86 @@ class MiNbaseNet(nn.Module):
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
     # --- TRONG CLASS MiNbaseNet ---
+    def generate_fc(self, in_dim, out_dim, old_fc=None):
+        new_fc = SimpleLinear(in_dim, out_dim, bias=True) # RLS thường cần Bias
+        if old_fc is not None:
+            nb_output = old_fc.out_features
+            weight = copy.deepcopy(old_fc.weight.data)
+            bias = copy.deepcopy(old_fc.bias.data)
+            new_fc.weight.data[:nb_output] = weight
+            new_fc.bias.data[:nb_output] = bias
+        return new_fc
+    @torch.no_grad()
+    def fit_uni(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        with autocast(enabled=False): # FP32 precision
+            # X ở đây đã qua Buffer và Universal Noise (được xử lý ở Min.py)
+            X = X.float()
+            X, Y = X.to(self.device), Y.to(self.device).float()
+
+            # Mở rộng Y nếu cần (cho khớp số class hiện tại)
+            if Y.shape[1] < self.fc_uni.out_features:
+                tail = torch.zeros((Y.shape[0], self.fc_uni.out_features - Y.shape[1])).to(Y)
+                Y = torch.cat((Y, tail), dim=1)
+
+            # RLS Update (Dùng self.R_uni)
+            # W_uni được lưu trong self.fc_uni.weight
+            # Cần transpose vì Linear lưu weight dạng [Out, In]
+            W = self.fc_uni.weight.data.T 
+            
+            # Logic RLS chuẩn
+            term = torch.eye(X.shape[0]).to(X) + X @ self.R_uni @ X.T
+            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            K = torch.inverse(term + jitter)
+            
+            self.R_uni -= self.R_uni @ X.T @ K @ X @ self.R_uni
+            W += self.R_uni @ X.T @ (Y - X @ W)
+            
+            self.fc_uni.weight.data = W.T # Gán ngược lại
+
+    # --- HÀM FIT CHO SPECIFIC (INDEPENDENT / RESET RLS) ---
+    @torch.no_grad()
+    def fit_spec(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        with autocast(enabled=False):
+            X = X.float()
+            X, Y = X.to(self.device), Y.to(self.device).float()
+            
+            # Xử lý Y: Y chỉ chứa one-hot của task hiện tại.
+            # Ta cần map nó vào đúng cột của W_spec.
+            # Tuy nhiên, để đơn giản và tận dụng tính chất Block, ta có thể update
+            # chỉ các cột tương ứng với task hiện tại.
+            
+            # 1. Reset RLS (Giải trực tiếp bằng Ridge Regression)
+            # W* = (X^T X + lambda I)^-1 X^T Y
+            lambda_reg = 1e-2
+            I = torch.eye(X.shape[1], device=X.device)
+            
+            # Covariance Matrix cục bộ
+            Cov = X.T @ X + lambda_reg * I
+            
+            # Tính W cho task này: [In_dim, Num_Classes_Task]
+            # Hàm pinv (Pseudo-inverse) ổn định hơn inverse
+            W_task = torch.linalg.pinv(Cov) @ (X.T @ Y)
+            
+            # 2. Cập nhật vào fc_spec
+            # Chỉ update các cột thuộc task hiện tại!
+            task_idxs = self.task_class_indices[self.cur_task]
+            
+            # fc_spec.weight shape: [Total_Classes, In_Dim]
+            # W_task shape: [In_Dim, Task_Classes]
+            self.fc_spec.weight.data[task_idxs, :] = W_task.T
+
+    # --- HÀM TRAIN NOISE (Dùng cho run) ---
+    def forward(self, x, new_forward: bool = False):
+        # Hàm này dùng để train Noise (Gradient Flow)
+        # Chỉ đi qua fc_spec để tối ưu hóa độ sắc nét cho Noise
+        # Lưu ý: Lúc run() ta đã set_noise_mode(cur_task)
+        
+        hyper_features = self.backbone(x) # Đã qua Noise(cur_task)
+        hyper_features = self.buffer(hyper_features).to(self.fc_spec.weight.dtype)
+        
+        # Dùng fc_spec để tính loss
+        logits = self.fc_spec(hyper_features)['logits']
+        return {'logits': logits}
 
     # [ADDED] Hàm điều khiển mode cho PiNoise
     def set_noise_mode(self, mode):
@@ -252,37 +339,75 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.backbone.noise_maker[0].mu)
         
-        # 1. Nhánh Universal (Gộp cứng)
-        self.set_noise_mode(-2) # Gọi vào universal_mu/sigma
+        # 1. Nhánh Universal (Nền tảng - Base)
+        self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_uni = self.backbone(x)
-            # Dùng Buffer và Classifier chung
-            feat_uni = self.buffer(feat_uni)
-            logits_uni = self.forward_fc(feat_uni) # Unified Classifier
+            feat_uni = self.buffer(self.backbone(x))
+            # Dùng W_uni
+            logits_uni = self.fc_uni(feat_uni)['logits'] 
 
-        # 2. Nhánh Specific (Selection bằng Entropy)
-        best_logits_spec = torch.zeros_like(logits_uni)
+        # 2. Nhánh Specific (Routing - Selection)
+        # Chúng ta cần tìm ra Task ID tốt nhất cho từng ảnh
         min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
+        best_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
+        
+        # Lưu lại logits expert của tất cả các task để sau này cộng dồn
+        # (Để tiết kiệm mem, có thể chỉ lưu best, nhưng để injection chính xác ta cần logic)
+        saved_task_logits = [] 
 
         with torch.no_grad():
             for t in range(num_tasks):
-                self.set_noise_mode(t) # Gọi expert t
-                
-                feat_t = self.backbone(x)
-                l_t = self.forward_fc(self.buffer(feat_t))
+                self.set_noise_mode(t)
+                feat_t = self.buffer(self.backbone(x))
+                # Dùng W_spec (Unified Matrix)
+                l_t = self.fc_spec(feat_t)['logits'] 
+                saved_task_logits.append(l_t) # Lưu lại
                 
                 # Tính Entropy
                 prob = torch.softmax(l_t, dim=1)
                 entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
                 
-                # Cập nhật Min Entropy
+                # Đua top Entropy
                 mask = entropy < min_entropy
                 min_entropy[mask] = entropy[mask]
-                best_logits_spec[mask] = l_t[mask]
+                best_task_ids[mask] = t
 
-        # 3. Cộng gộp
-        #final_logits = logits_uni + best_logits_spec
-        final_logits = best_logits_spec
+        # 3. Sparse Logit Injection (Cộng dồn thông minh)
+        final_logits = logits_uni.clone()
+        
+        # Debug Magnitudes (Yêu cầu của bạn)
+        # Lấy đại diện logit của task chiến thắng để in
+        debug_spec_logits = torch.zeros_like(logits_uni)
+        for i in range(batch_size):
+            debug_spec_logits[i] = saved_task_logits[best_task_ids[i]][i]
+            
+        print(f"DEBUG: Uni Mag: {logits_uni.abs().mean().item():.3f} | Spec Mag: {debug_spec_logits.abs().mean().item():.3f}")
+
+        # Thực hiện cộng dồn: Base + Expert(của đúng task đó)
+        # Các class không thuộc task đó sẽ được cộng 0 (implicit)
+        for t in range(num_tasks):
+            # Lấy indices class của task t
+            if t in self.task_class_indices:
+                class_idxs = self.task_class_indices[t]
+                
+                # Mask những ảnh chọn Task t
+                mask_t = (best_task_ids == t)
+                
+                if mask_t.sum() > 0:
+                    # Lấy logits expert tương ứng
+                    expert_l = saved_task_logits[t][mask_t]
+                    
+                    # Chỉ cộng vào đúng các cột class của task t
+                    # final_logits[mask_t][:, class_idxs] += expert_l[:, class_idxs] 
+                    # FIX: PyTorch indexing phức tạp, dùng cách an toàn hơn:
+                    
+                    cols = torch.tensor(class_idxs, device=self.device)
+                    # Lấy phần sub-tensor cần cộng
+                    update_vals = expert_l[:, cols]
+                    
+                    # Cộng inplace
+                    final_logits[mask_t][:, cols] += update_vals
+
         self.set_noise_mode(-2)
         if was_training: self.train()
         
