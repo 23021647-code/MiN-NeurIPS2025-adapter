@@ -8,6 +8,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
 import gc 
+import matplotlib.pyplot as plt
+import numpy as np
 import os
 
 from utils.inc_net import MiNbaseNet
@@ -90,6 +92,7 @@ class MinNet(object):
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         del test_set
+        self.analyze_entropy_accuracy(test_loader)
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
@@ -377,3 +380,71 @@ class MinNet(object):
         prototype = torch.mean(torch.cat(features, dim=0), dim=0).to(self.device)
         self._clear_gpu()
         return prototype
+
+
+    def analyze_entropy_accuracy(self, test_loader):
+        self._network.eval()
+        all_entropies = []
+        all_correct_flags = []
+    
+        print(">>> Analyzing Entropy vs Accuracy correlation...")
+        with torch.no_grad():
+            for _, inputs, targets in tqdm(test_loader, desc="Collecting Entropy Data"):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                batch_size = inputs.shape[0]
+                num_tasks = self.cur_task + 1
+                
+                # Kiểm tra từng adapter (tương ứng từng task đã học)
+                for t in range(num_tasks):
+                    self._network.set_noise_mode(t)
+                    # Trích xuất feature và tính logits cho task t
+                    feat_t = self._network.extract_feature(inputs)
+                    l_t = self._network.fc_spec(feat_t)['logits']
+                    
+                    # Tính Entropy cho các class thuộc task t [cite: 222]
+                    if t in self._network.task_class_indices:
+                        task_cols = self._network.task_class_indices[t]
+                        l_t_masked = l_t[:, task_cols]
+                        prob = torch.softmax(l_t_masked, dim=1)
+                        entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                        
+                        # Kiểm tra dự đoán của riêng adapter này có đúng nhãn không
+                        predicts = torch.max(l_t_masked, dim=1)[1]
+                        # Chuyển đổi predict từ local task index sang global index
+                        global_predicts = torch.tensor([task_cols[p] for p in predicts.cpu().numpy()]).to(self.device)
+                        correct = (global_predicts == targets).float()
+    
+                        all_entropies.extend(entropy.cpu().numpy())
+                        all_correct_flags.extend(correct.cpu().numpy())
+    
+        self._plot_tuna_proof(all_entropies, all_correct_flags)
+    
+    def _plot_tuna_proof(self, entropies, correct_flags, num_bins=10):
+        entropies = np.array(entropies)
+        correct_flags = np.array(correct_flags)
+    
+        # Chia dữ liệu thành các nhóm (bins) theo mức độ Entropy 
+        bin_edges = np.linspace(entropies.min(), entropies.max(), num_bins + 1)
+        accuracies = []
+        avg_entropies = []
+    
+        for i in range(num_bins):
+            mask = (entropies >= bin_edges[i]) & (entropies < bin_edges[i+1])
+            if mask.any():
+                accuracies.append(correct_flags[mask].mean() * 100)
+                avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
+    
+        # Vẽ biểu đồ tương tự Figure 2 trong TUNA [cite: 246]
+        plt.figure(figsize=(8, 6))
+        plt.plot(accuracies, avg_entropies, marker='o', color='black', linewidth=2)
+        plt.xlabel('Accuracy (%)', fontsize=12)
+        plt.ylabel('Entropy', fontsize=12)
+        plt.title(f'Entropy vs Accuracy Correlation (Task {self.cur_task})', fontsize=14)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        
+        # Đảo ngược trục Y: Entropy thấp (tự tin) nằm ở trên cùng tương ứng Acc cao 
+        plt.gca().invert_yaxis() 
+        
+        plt.savefig(f'routing_proof_task_{self.cur_task}.png')
+        plt.close()
+        print(f">>> Chứng minh đã được lưu tại: routing_proof_task_{self.cur_task}.png")
