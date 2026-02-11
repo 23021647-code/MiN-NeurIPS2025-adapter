@@ -94,6 +94,9 @@ class MinNet(object):
         del test_set
         self.analyze_entropy_accuracy(test_loader)
         self.analyze_universal_correlation(test_loader)
+        self.sanity_check()
+        
+        
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
@@ -557,3 +560,51 @@ class MinNet(object):
         plt.savefig(f'universal_proof_task_{self.cur_task}.png')
         plt.close()
         print(f">>> Biểu đồ Universal đã lưu tại universal_proof_task_{self.cur_task}.png")
+    def sanity_check(self):
+        self._network.eval()
+        print(f"\n=== SANITY CHECK: TASK {self.cur_task} ===")
+        
+        with torch.no_grad():
+            # 1. KIỂM TRA ĐỘ TRỰC GIAO (ORTHOGONALITY)
+            for idx, m in enumerate(self._network.backbone.noise_maker):
+                if self.cur_task > 0:
+                    current_mu = m.mu[self.cur_task].weight.flatten()
+                    old_mus = torch.stack([m.mu[t].weight.flatten() for t in range(self.cur_task)])
+                    
+                    # Tính Cosine Similarity (Càng gần 0 càng tốt)
+                    cos_sim = F.cosine_similarity(current_mu.unsqueeze(0), old_mus)
+                    avg_sim = cos_sim.abs().mean().item()
+                    max_sim = cos_sim.abs().max().item()
+                    
+                    print(f"Layer {idx} Noise Orthogonality:")
+                    print(f"   - Avg Abs Cos-Sim: {avg_sim:.4f} (Mục tiêu: < 0.1)")
+                    print(f"   - Max Abs Cos-Sim: {max_sim:.4f}")
+    
+            # 2. KIỂM TRA MA TRẬN R (ĐÁP LẠI CLAUDE)
+            if hasattr(self, 'R_spec') and self.R_spec is not None:
+                r_norm = torch.norm(self.R_spec).item()
+                # Kiểm tra trị riêng để xem ma trận có bị suy biến (singular) không
+                eigvals = torch.linalg.eigvalsh(self.R_spec)
+                cond_number = eigvals.max() / (eigvals.min() + 1e-8)
+                
+                print(f"RLS Matrix R Health:")
+                print(f"   - Frobenius Norm: {r_norm:.2f}")
+                print(f"   - Condition Number: {cond_number.item():.2e} (Nếu > 1e7 là có vấn đề)")
+    
+            # 3. KIỂM TRA TRỌNG SỐ FC (WEIGHT INHERITANCE)
+            # So sánh chuẩn (norm) của các dòng cũ và dòng mới
+            weights = self._network.normal_fc.weight.data
+            if self.cur_task > 0:
+                old_indices = []
+                for t in range(self.cur_task):
+                    old_indices.extend(self.task_class_indices[t])
+                new_indices = self.task_class_indices[self.cur_task]
+                
+                old_norm = torch.norm(weights[old_indices], p=2, dim=1).mean().item()
+                new_norm = torch.norm(weights[new_indices], p=2, dim=1).mean().item()
+                
+                print(f"Classifier Weight Balance:")
+                print(f"   - Old Classes Avg Norm: {old_norm:.4f}")
+                print(f"   - New Classes Avg Norm: {new_norm:.4f}")
+                print(f"   - Ratio (New/Old): {new_norm/old_norm:.2f}")
+        print("========================================\n")
