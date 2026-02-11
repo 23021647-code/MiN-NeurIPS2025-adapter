@@ -310,30 +310,45 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            correct, total = 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
+                
                 with autocast('cuda'):
+                    # 1. Forward và tính Cross Entropy Loss
                     if self.cur_task > 0:
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
+                        logits2 = outputs2['logits'] + logits1
+                        loss_ce = F.cross_entropy(logits2, targets.long())
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
+                        loss_ce = F.cross_entropy(outputs["logits"], targets.long())
 
-                self.scaler.scale(loss).backward()
+                    # 2. TÍNH ORTHOGONAL LOSS (Chỉ từ Task 1 trở đi)
+                    loss_orth = 0.0
+                    if self.cur_task > 0:
+                        # Duyệt qua từng layer có chứa PiNoise
+                        for m in self._network.backbone.noise_maker:
+                            # mu shape: [num_tasks, 192]
+                            current_mu = m.mu[self.cur_task] 
+                            old_mus = m.mu[:self.cur_task]   # Các task cũ
+                            
+                            # Tính tích vô hướng: (1, 192) x (192, t) -> (1, t)
+                            # Càng gần 0 càng tốt
+                            dot_products = torch.matmul(old_mus, current_mu.unsqueeze(1))
+                            loss_orth += torch.norm(dot_products, p=2)
+
+                    # 3. Tổng Loss với hệ số lamda (thường chọn 0.1 hoặc 0.01)
+                    lamda_orth = 0.1
+                    total_loss = loss_ce + lamda_orth * loss_orth
+
+                self.scaler.scale(total_loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
-                losses += loss.item()
+                losses += total_loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
