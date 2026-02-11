@@ -347,14 +347,17 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
+        
+        # [MODIFIED] Inference Loop
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
                 
                 if self.cur_task > 0:
-                    # GỌI HÀM HYBRID
+                    # Gọi hàm Hybrid (Universal + Selection)
                     outputs = model.forward_tuna_combined(inputs)
                 else:
+                    # Task 0 chưa có gộp, chạy mode Universal mặc định (hoặc mode 0)
                     model.set_noise_mode(-2)
                     outputs = model(inputs)
 
@@ -363,7 +366,19 @@ class MinNet(object):
                 pred.extend(predicts.cpu().numpy())
                 label.extend(targets.cpu().numpy())
         
-        return calculate_class_metrics(pred, label)
+        # [MODIFIED] Tính toán metrics và map key đúng định dạng cũ
+        class_info = calculate_class_metrics(pred, label)
+        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        
+        # Trả về dictionary đầy đủ key để after_train không bị lỗi Key Error
+        return {
+            "all_class_accy": class_info['all_accy'],  # <--- Key này quan trọng nhất
+            "class_accy": class_info['class_accy'],
+            "class_confusion": class_info['class_confusion_matrices'],
+            "task_accy": task_info['all_accy'],
+            "task_confusion": task_info['task_confusion_matrices'],
+            "all_task_accy": task_info['task_accy'],
+        }
 
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
