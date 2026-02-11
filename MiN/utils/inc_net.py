@@ -230,7 +230,13 @@ class MiNbaseNet(nn.Module):
                 if t in self.task_class_indices:
                     task_cols = self.task_class_indices[t]
                     l_t_masked = l_t[:, task_cols] 
-                    prob = torch.softmax(l_t_masked, dim=1)
+                    
+                    # --- THÊM TEMPERATURE SCALING Ở ĐÂY ---
+                    # scale_factor = 5.0 tương đương với Temperature T = 0.2
+                    # Nó giúp phóng đại sự khác biệt nhỏ giữa các logits
+                    scale_factor = 5.0 
+                    prob = torch.softmax(l_t_masked * scale_factor, dim=1)
+                    
                     entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
                     mask = entropy < min_entropy
                     min_entropy[mask] = entropy[mask]
@@ -304,6 +310,7 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         for p in self.backbone.norm.parameters(): p.requires_grad = True
+
 
 
 
