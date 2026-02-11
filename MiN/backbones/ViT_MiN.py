@@ -116,7 +116,7 @@ class PiNoise(torch.nn.Linear):
         self.hidden_dim = hidden_dim
 
         self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
-        self.register_buffer("weight_down", self.w_down)
+        self.register_buffer("weight", self.w_down)
 
         self.reset_parameters()
 
@@ -126,7 +126,7 @@ class PiNoise(torch.nn.Linear):
         self.sigmma = nn.ModuleList()
 
         self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
-        self.register_buffer("weight_up", self.w_up)
+        self.register_buffer("weight", self.w_up)
         self.reset_parameters()
 
         self.weight_noise = None
@@ -195,7 +195,7 @@ class PiNoise(torch.nn.Linear):
 
     def forward(self, x):
         x_1 = self.MLP(x)
-        x_down = x @ self.weight_down
+        x_down = x @ self.w_down
         noise = 0
         
         if self.active_task_idx >= 0:
@@ -208,7 +208,7 @@ class PiNoise(torch.nn.Linear):
             # Dùng trực tiếp trọng số đã gộp (Nhanh hơn vòng lặp cũ nhiều)
             noise = self.universal_mu(x_down) + self.universal_sigmma(x_down)
         
-        return x_1 + (noise @ self.weight_up) + x
+        return x_1 + (noise @ self.w_up) + x
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
