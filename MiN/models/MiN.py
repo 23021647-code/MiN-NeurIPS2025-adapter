@@ -346,13 +346,22 @@ class MinNet(object):
                     loss_orth = torch.tensor(0.0).to(self.device)
                     if self.cur_task > 0:
                         for m in self._network.backbone.noise_maker:
-                            # Trích xuất vector mu hiện tại và các vector mu cũ
-                            current_mu = m.mu[self.cur_task] # [192]
-                            old_mus = m.mu[:self.cur_task]   # [num_old_tasks, 192]
+                            # 1. Lấy trọng số của Expert hiện tại và làm phẳng (flatten)
+                            # m.mu[self.cur_task] là một lớp nn.Linear
+                            current_mu_w = m.mu[self.cur_task].weight.flatten() # [192 * In_Dim]
                             
-                            # Tính tích vô hướng để ép các hướng Expert vuông góc nhau
-                            # [num_old_tasks, 192] @ [192, 1] -> [num_old_tasks, 1]
-                            dot_products = torch.matmul(old_mus, current_mu.unsqueeze(1))
+                            # 2. Thu thập trọng số của tất cả các Expert cũ
+                            # Stack chúng lại thành một Tensor duy nhất để tính toán song song
+                            old_mu_weights = torch.stack([
+                                m.mu[t].weight.flatten() for t in range(self.cur_task)
+                            ]) # [num_old_tasks, 192 * In_Dim]
+                            
+                            # 3. Tính tích vô hướng (Dot Product)
+                            # Càng gần 0 nghĩa là các Expert càng vuông góc (trực giao)
+                            # [num_old_tasks, Dim] @ [Dim, 1] -> [num_old_tasks, 1]
+                            dot_products = torch.matmul(old_mu_weights, current_mu_w.unsqueeze(1))
+                            
+                            # Sử dụng Frobenius norm (hoặc L2 norm) để phạt các phần tử khác 0
                             loss_orth += torch.norm(dot_products, p=2)
 
                     # --- PHẦN 3: TỔNG HỢP VÀ BACKWARD ---
