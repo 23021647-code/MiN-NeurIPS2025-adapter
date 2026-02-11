@@ -382,40 +382,47 @@ class MinNet(object):
         return prototype
 
 
-    def analyze_entropy_accuracy(self, test_loader):
+    def analyze_entropy_accuracy_fast(self, test_loader):
         self._network.eval()
         all_entropies = []
         all_correct_flags = []
     
-        print(">>> Analyzing Entropy vs Accuracy correlation...")
+        print(">>> Fast Analysis: Caching features for proof...")
+        # 1. Trích xuất feature thô (Base features) 1 lần duy nhất
+        raw_features = []
+        targets_list = []
         with torch.no_grad():
-            for _, inputs, targets in tqdm(test_loader, desc="Collecting Entropy Data"):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                batch_size = inputs.shape[0]
-                num_tasks = self.cur_task + 1
-                
-                # Kiểm tra từng adapter (tương ứng từng task đã học)
-                for t in range(num_tasks):
-                    self._network.set_noise_mode(t)
-                    # Trích xuất feature và tính logits cho task t
-                    feat_t = self._network.extract_feature(inputs)
-                    l_t = self._network.fc_spec(feat_t)['logits']
-                    
-                    # Tính Entropy cho các class thuộc task t [cite: 222]
-                    if t in self._network.task_class_indices:
-                        task_cols = self._network.task_class_indices[t]
-                        l_t_masked = l_t[:, task_cols]
-                        prob = torch.softmax(l_t_masked, dim=1)
-                        entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                        
-                        # Kiểm tra dự đoán của riêng adapter này có đúng nhãn không
-                        predicts = torch.max(l_t_masked, dim=1)[1]
-                        # Chuyển đổi predict từ local task index sang global index
-                        global_predicts = torch.tensor([task_cols[p] for p in predicts.cpu().numpy()]).to(self.device)
-                        correct = (global_predicts == targets).float()
+            for _, inputs, targets in test_loader:
+                # Chỉ chạy qua backbone 1 lần
+                feat = self._network.backbone(inputs.to(self.device))
+                raw_features.append(feat.cpu())
+                targets_list.append(targets.cpu())
+        
+        raw_features = torch.cat(raw_features, dim=0)
+        targets_all = torch.cat(targets_list, dim=0)
     
-                        all_entropies.extend(entropy.cpu().numpy())
-                        all_correct_flags.extend(correct.cpu().numpy())
+        # 2. Chạy qua các Expert (Chỉ là các lớp Linear nhỏ, cực nhanh)
+        num_tasks = self.cur_task + 1
+        for t in range(num_tasks):
+            self._network.set_noise_mode(t)
+            with torch.no_grad():
+                # Chạy qua PiNoise (Expert) + Buffer + FC
+                # PiNoise nhận raw_features đã cache
+                f_t = self._network.buffer(self._network.backbone.noise_maker[0].forward_from_feat(raw_features.to(self.device)))
+                l_t = self._network.fc_spec(f_t)['logits']
+                
+                if t in self._network.task_class_indices:
+                    task_cols = self._network.task_class_indices[t]
+                    l_t_masked = l_t[:, task_cols]
+                    prob = torch.softmax(l_t_masked, dim=1)
+                    entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                    
+                    predicts = torch.max(l_t_masked, dim=1)[1]
+                    global_preds = torch.tensor([task_cols[p] for p in predicts.cpu().numpy()]).to(self.device)
+                    correct = (global_preds == targets_all.to(self.device)).float()
+    
+                    all_entropies.extend(entropy.cpu().numpy())
+                    all_correct_flags.extend(correct.cpu().numpy())
     
         self._plot_tuna_proof(all_entropies, all_correct_flags)
     
