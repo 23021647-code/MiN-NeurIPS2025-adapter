@@ -382,7 +382,7 @@ class MinNet(object):
         return prototype
 
 
-    def analyze_entropy_accuracy_fast(self, test_loader):
+    def analyze_entropy_accuracy(self, test_loader):
         self._network.eval()
         all_entropies = []
         all_correct_flags = []
