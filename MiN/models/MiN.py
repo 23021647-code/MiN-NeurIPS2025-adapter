@@ -382,47 +382,48 @@ class MinNet(object):
         return prototype
 
 
+
     def analyze_entropy_accuracy(self, test_loader):
         self._network.eval()
         all_entropies = []
         all_correct_flags = []
     
-        print(">>> Fast Analysis: Caching features for proof...")
-        # 1. Trích xuất feature thô (Base features) 1 lần duy nhất
-        raw_features = []
-        targets_list = []
+        print(">>> Analyzing Entropy vs Accuracy (TUNA Pilot Study Style)...")
+        # Lấy giới hạn mẫu để không chạy quá lâu (ví dụ 1000 mẫu đầu)
+        max_samples = 1000 
+        current_samples = 0
+    
         with torch.no_grad():
-            for _, inputs, targets in test_loader:
-                # Chỉ chạy qua backbone 1 lần
-                feat = self._network.backbone(inputs.to(self.device))
-                raw_features.append(feat.cpu())
-                targets_list.append(targets.cpu())
-        
-        raw_features = torch.cat(raw_features, dim=0)
-        targets_all = torch.cat(targets_list, dim=0)
-    
-        # 2. Chạy qua các Expert (Chỉ là các lớp Linear nhỏ, cực nhanh)
-        num_tasks = self.cur_task + 1
-        for t in range(num_tasks):
-            self._network.set_noise_mode(t)
-            with torch.no_grad():
-                # Chạy qua PiNoise (Expert) + Buffer + FC
-                # PiNoise nhận raw_features đã cache
-                f_t = self._network.buffer(self._network.backbone.noise_maker[0].forward_from_feat(raw_features.to(self.device)))
-                l_t = self._network.fc_spec(f_t)['logits']
+            for _, inputs, targets in tqdm(test_loader, desc="Collecting Data"):
+                if current_samples >= max_samples: break
                 
-                if t in self._network.task_class_indices:
-                    task_cols = self._network.task_class_indices[t]
-                    l_t_masked = l_t[:, task_cols]
-                    prob = torch.softmax(l_t_masked, dim=1)
-                    entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                    
-                    predicts = torch.max(l_t_masked, dim=1)[1]
-                    global_preds = torch.tensor([task_cols[p] for p in predicts.cpu().numpy()]).to(self.device)
-                    correct = (global_preds == targets_all.to(self.device)).float()
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                num_tasks = self.cur_task + 1
     
-                    all_entropies.extend(entropy.cpu().numpy())
-                    all_correct_flags.extend(correct.cpu().numpy())
+                # Duyệt qua từng Expert (Noise Mode) như Pilot Study của bài báo
+                for t in range(num_tasks):
+                    self._network.set_noise_mode(t)
+                    # BẮT BUỘC chạy extract_feature vì PiNoise nằm trong Backbone
+                    feat_t = self._network.extract_feature(inputs)
+                    l_t = self._network.fc_spec(feat_t)['logits']
+                    
+                    if t in self._network.task_class_indices:
+                        task_cols = self._network.task_class_indices[t]
+                        l_t_masked = l_t[:, task_cols]
+                        
+                        # Tính Entropy dự đoán
+                        prob = torch.softmax(l_t_masked, dim=1)
+                        entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                        
+                        # Kiểm tra Accuracy của riêng Expert này
+                        predicts = torch.max(l_t_masked, dim=1)[1]
+                        global_preds = torch.tensor([task_cols[p] for p in predicts.cpu().numpy()]).to(self.device)
+                        correct = (global_preds == targets).float()
+    
+                        all_entropies.extend(entropy.cpu().numpy())
+                        all_correct_flags.extend(correct.cpu().numpy())
+                
+                current_samples += inputs.shape[0]
     
         self._plot_tuna_proof(all_entropies, all_correct_flags)
     
@@ -430,7 +431,7 @@ class MinNet(object):
         entropies = np.array(entropies)
         correct_flags = np.array(correct_flags)
     
-        # Chia dữ liệu thành các nhóm (bins) theo mức độ Entropy 
+        # Chia bins theo Entropy (Figure 2 trong TUNA)
         bin_edges = np.linspace(entropies.min(), entropies.max(), num_bins + 1)
         accuracies = []
         avg_entropies = []
@@ -441,17 +442,16 @@ class MinNet(object):
                 accuracies.append(correct_flags[mask].mean() * 100)
                 avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
     
-        # Vẽ biểu đồ tương tự Figure 2 trong TUNA [cite: 246]
         plt.figure(figsize=(8, 6))
         plt.plot(accuracies, avg_entropies, marker='o', color='black', linewidth=2)
         plt.xlabel('Accuracy (%)', fontsize=12)
         plt.ylabel('Entropy', fontsize=12)
-        plt.title(f'Entropy vs Accuracy Correlation (Task {self.cur_task})', fontsize=14)
+        plt.title(f'Pilot Study: Entropy-Accuracy Correlation (Task {self.cur_task})', fontsize=14)
         plt.grid(True, linestyle='--', alpha=0.6)
+        plt.gca().invert_yaxis() # Entropy thấp (tự tin) nằm ở trên cao
         
-        # Đảo ngược trục Y: Entropy thấp (tự tin) nằm ở trên cùng tương ứng Acc cao 
-        plt.gca().invert_yaxis() 
-        
-        plt.savefig(f'routing_proof_task_{self.cur_task}.png')
+        # Lưu file để xem trong phần Output của Kaggle
+        plt.savefig(f'tuna_proof_task_{self.cur_task}.png')
+        plt.show() # Hiển thị ngay trong Notebook
         plt.close()
-        print(f">>> Chứng minh đã được lưu tại: routing_proof_task_{self.cur_task}.png")
+        print(f">>> Biểu đồ đã lưu tại tuna_proof_task_{self.cur_task}.png")
