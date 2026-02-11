@@ -131,16 +131,12 @@ class PiNoise(torch.nn.Linear):
 
         self.weight_noise = None
         self.active_task_idx = -2
-        # [NEW] Expert Tổng Quát (Universal) - Là một mạng vật lý
         self.universal_mu = nn.Linear(hidden_dim, hidden_dim).to(device)
         self.universal_sigmma = nn.Linear(hidden_dim, hidden_dim).to(device)
-        
-        # Init Universal bằng 0 ban đầu
         nn.init.zeros_(self.universal_mu.weight); nn.init.zeros_(self.universal_mu.bias)
         nn.init.zeros_(self.universal_sigmma.weight); nn.init.zeros_(self.universal_sigmma.bias)
-
     def update_noise(self):
-        # [MODIFIED] Luôn khởi tạo Expert mới về 0 (Zero Init)
+        # Zero Init cho Expert mới
         self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         
@@ -148,50 +144,28 @@ class PiNoise(torch.nn.Linear):
         torch.nn.init.constant_(self.mu[-1].bias, 0.)
         torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
         torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
-    def merge_noise(self):
-        """Hàm gộp trọng số TUNA, gọi sau khi train xong"""
-        if len(self.mu) == 0: return
 
-        print(f"  -> Merging {len(self.mu)} experts via EMR...")
+    def merge_noise(self):
+        """TUNA EMR Merge"""
+        if len(self.mu) == 0: return
+        # print(f"  -> Merging {len(self.mu)} experts via EMR...")
         with torch.no_grad():
-            # 1. Gộp MU
             mu_weights = [m.weight.data for m in self.mu]
             mu_biases = [m.bias.data for m in self.mu]
-            
             self.universal_mu.weight.copy_(emr_merge_tensors(mu_weights))
             self.universal_mu.bias.copy_(emr_merge_tensors(mu_biases))
 
-            # 2. Gộp SIGMA
             sigma_weights = [s.weight.data for s in self.sigmma]
             sigma_biases = [s.bias.data for s in self.sigmma]
-            
             self.universal_sigmma.weight.copy_(emr_merge_tensors(sigma_weights))
             self.universal_sigmma.bias.copy_(emr_merge_tensors(sigma_biases))
     
     def init_weight_noise(self, prototypes):
-        if len(prototypes) <= 1:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
-        else:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
-            weight = torch.ones(len(self.mu))
-            for i in range(len(prototypes)):
-                mu_t = prototypes[-1]
-                mu_i = prototypes[i]
-                dot_product = torch.dot(mu_t, mu_i)
-                norm_t = torch.norm(mu_t)
-                norm_i = torch.norm(mu_i)
-                s_i = dot_product / (norm_t * norm_i)
-                weight[i] = s_i.detach().clone()
-            weight = torch.softmax(weight, dim=-1)
-            self.weight_noise = weight
-            self.weight_noise.requires_grad = True
-            
-    def unfreeze_noise(self):
+        pass # Không dùng mixing weight nữa
 
-        for param in self.mu[-1].parameters():
-            param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
-            param.requires_grad = True
+    def unfreeze_noise(self):
+        for param in self.mu[-1].parameters(): param.requires_grad = True
+        for param in self.sigmma[-1].parameters(): param.requires_grad = True
 
     def forward(self, x):
         x_1 = self.MLP(x)
@@ -199,17 +173,16 @@ class PiNoise(torch.nn.Linear):
         noise = 0
         
         if self.active_task_idx >= 0:
-            # --- Specific Branch ---
+            # --- Specific Branch (Dùng cho Train & Routing) ---
             idx = self.active_task_idx
             if idx < len(self.mu):
                 noise = self.mu[idx](x_down) + self.sigmma[idx](x_down)
         else:
-            # --- Universal Branch ---
-            # Dùng trực tiếp trọng số đã gộp (Nhanh hơn vòng lặp cũ nhiều)
+            # --- Universal Branch (Dùng cho Base Prediction) ---
             noise = self.universal_mu(x_down) + self.universal_sigmma(x_down)
         
         return x_1 + (noise @ self.w_up) + x
-
+    
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
 
