@@ -245,85 +245,45 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    # [ADDED] Logic tìm kết quả tự tin nhất (Max Logit)
-    # Sửa hàm này trong MiNbaseNet
-    def forward_tuna_combined(self, x, debug_targets=None):
-        # debug_targets: Nhãn (Label) thật để kiểm tra xem router chọn có đúng task không
+    def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
         
         batch_size = x.shape[0]
         num_tasks = len(self.backbone.noise_maker[0].mu)
         
-        # 1. Universal
-        self.set_noise_mode(-2)
+        # 1. Nhánh Universal (Gộp cứng)
+        self.set_noise_mode(-2) # Gọi vào universal_mu/sigma
         with torch.no_grad():
-            l_uni = self.forward_fc(self.buffer(self.backbone(x)))
+            feat_uni = self.backbone(x)
+            # Dùng Buffer và Classifier chung
+            feat_uni = self.buffer(feat_uni)
+            logits_uni = self.forward_fc(feat_uni) # Unified Classifier
 
-        # 2. Specific Selection
-        best_l_spec = torch.zeros_like(l_uni)
+        # 2. Nhánh Specific (Selection bằng Entropy)
+        best_logits_spec = torch.zeros_like(logits_uni)
         min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
-        selected_task_indices = torch.full((batch_size,), -1, device=x.device, dtype=torch.long)
-
-        # Lưu lại entropy của tất cả các task để so sánh
-        debug_entropy_matrix = [] 
 
         with torch.no_grad():
             for t in range(num_tasks):
-                self.set_noise_mode(t)
-                l_t = self.forward_fc(self.buffer(self.backbone(x)))
+                self.set_noise_mode(t) # Gọi expert t
                 
+                feat_t = self.backbone(x)
+                l_t = self.forward_fc(self.buffer(feat_t))
+                
+                # Tính Entropy
                 prob = torch.softmax(l_t, dim=1)
                 entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
                 
-                if debug_targets is not None:
-                    debug_entropy_matrix.append(entropy.unsqueeze(1))
-
+                # Cập nhật Min Entropy
                 mask = entropy < min_entropy
                 min_entropy[mask] = entropy[mask]
-                best_l_spec[mask] = l_t[mask]
-                selected_task_indices[mask] = t # Lưu lại task nào được chọn
+                best_logits_spec[mask] = l_t[mask]
 
-        final_logits = l_uni + best_l_spec
+        # 3. Cộng gộp
+        final_logits = logits_uni + best_logits_spec
+
         self.set_noise_mode(-2)
         if was_training: self.train()
-
-        # --- PHẦN LOG DEBUG ---
-        debug_info = {}
-        if debug_targets is not None:
-            # Giả sử mỗi task có increment class (ví dụ 10 class/task)
-            # Cần tính Task ID thật của ảnh dựa trên Label
-            # Ví dụ: Label 15 (increment=10) -> Task ID = 1
-            increment = self.args['increment'] if 'increment' in self.args else 10 # Check args
-            init_cls = self.args['init_class'] if 'init_class' in self.args else 10
-            
-            # Logic tính Task ID từ Label (đơn giản hóa)
-            gt_task_ids = torch.zeros_like(debug_targets)
-            gt_task_ids[debug_targets < init_cls] = 0
-            for k in range(1, num_tasks):
-                lower = init_cls + (k-1)*increment
-                upper = init_cls + k*increment
-                mask = (debug_targets >= lower) & (debug_targets < upper)
-                gt_task_ids[mask] = k
-            
-            # 1. Routing Accuracy: Tỷ lệ chọn đúng chuyên gia
-            correct_routing = (selected_task_indices == gt_task_ids).float().mean().item()
-            
-            # 2. Entropy Gap: Entropy của Task đúng vs Entropy thấp nhất tìm được
-            # (Nếu Task đúng mà Entropy cao -> Model ngu ở task đó)
-            entropies = torch.cat(debug_entropy_matrix, dim=1) # [Batch, Num_Task]
-            # Lấy entropy của task đúng
-            gt_entropies = entropies.gather(1, gt_task_ids.unsqueeze(1)).squeeze()
-            avg_gt_entropy = gt_entropies.mean().item()
-            avg_min_entropy = min_entropy.mean().item()
-
-            debug_info = {
-                "routing_acc": correct_routing * 100,
-                "avg_entropy_selected": avg_min_entropy,
-                "avg_entropy_groundtruth": avg_gt_entropy,
-                "task_distribution": [
-                    (selected_task_indices == t).sum().item() for t in range(num_tasks)
-                ]
-            }
-
-        return {'logits': final_logits, 'debug_info': debug_info}
+        
+        return {'logits': final_logits}
