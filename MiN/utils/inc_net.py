@@ -134,94 +134,63 @@ class MiNbaseNet(nn.Module):
                 nn.init.constant_(new_fc.bias.data[nb_old:], 0.)
             self.normal_fc = new_fc
 
-    # --- HÀM RESET CHO SPECIFIC ---
     def reset_R_spec(self):
-        # Reset về ma trận đơn vị (Identity) / gamma
         self.R_spec = torch.eye(self.buffer_size, device=self.device, dtype=torch.float32) / self.gamma
 
-    # --- CORE LOGIC: BATCH RLS (Y hệt code gốc của bạn) ---
+    # --- CORE LOGIC: BATCH RLS (Sử dụng solve để tối ưu tốc độ) ---
     def _fit_RLS_batch(self, X, Y, fc_layer, R_matrix):
-        # X: Input Features (Batch, Dim)
-        # Y: One-hot labels (Batch, Class)
+        # 1. Tính toán K (Kalman Gain) dùng linalg.solve (Nhanh và ổn định hơn inverse)
+        # Solve: (I + X R X^T) K = X R
+        term = torch.eye(X.shape[0], device=X.device) + X @ R_matrix @ X.T
+        # K_bridge = (I + X R X^T)^-1 @ X @ R
+        # Dùng solve để tìm K_bridge trực tiếp
+        K_bridge = torch.linalg.solve(term, X @ R_matrix)
         
-        # Logic resize weight động (theo code gốc)
-        num_targets = Y.shape[1]
-        if num_targets > fc_layer.out_features:
-            increment_size = num_targets - fc_layer.out_features
-            tail = torch.zeros((fc_layer.weight.shape[0], increment_size)).to(fc_layer.weight)
-            # Transpose vì Linear lưu [Out, In] còn logic RLS đang tính [In, Out]
-            # Nhưng khoan, code gốc bạn cat dim=1 tức là Weight đang [In, Out]?
-            # SimpleLinear của pytorch lưu [Out, In]. 
-            # -> Code gốc bạn có lẽ đang lưu Weight dạng [In, Out] (Transposed).
-            # Để an toàn, tôi sẽ tuân thủ Pytorch Linear [Out, In]
-            
-            # Pytorch Linear: weight [Out, In], bias [Out]
-            # RLS Logic thường dùng: W [In, Out]
-            
-            # Tôi sẽ chuyển vị W ra, tính toán, rồi chuyển vị lại gán vào.
-            pass # Đã handle ở update_fc rồi nên không cần dynamic resize ở đây cho an toàn.
-
-        # --- BẮT ĐẦU LOGIC TOÁN HỌC ---
-        # 1. Tính K (Kalman Gain) - Nghịch đảo Batch Size (Nhanh)
-        # K = (I + X R X^T)^-1
-        # X: [B, D], R: [D, D]
-        term = torch.eye(X.shape[0]).to(X) + X @ R_matrix @ X.T
-        K = torch.inverse(term)
-        
-        # 2. Update R
-        # R = R - R X^T K X R
-        R_matrix = R_matrix - (R_matrix @ X.T @ K @ X @ R_matrix)
+        # 2. Update R_matrix
+        R_matrix = R_matrix - (R_matrix @ X.T @ K_bridge)
         
         # 3. Update Weight
-        # W = W + R X^T (Y - X W)
-        # Lưu ý: fc_layer.weight là [Out, In]. Cần Transpose thành [In, Out] để nhân
-        W_curr = fc_layer.weight.data.T 
+        # Error = Y - XW
+        W_curr = fc_layer.weight.data.T
+        error = Y - X @ W_curr
+        W_new = W_curr + R_matrix @ X.T @ error
         
-        # Logic gốc của bạn: self.weight += self.R @ X.T @ (Y - X @ self.weight)
-        W_new = W_curr + R_matrix @ X.T @ (Y - X @ W_curr)
-        
-        # Gán ngược lại
         fc_layer.weight.data = W_new.T
-        
         return R_matrix
+
+    # --- CÁC HÀM FIT CHIẾN THUẬT ---
+    
+    # 1. Fit dùng Feature đã cache (DÙNG CÁI NÀY TRONG MIN.PY ĐỂ NHANH)
+    @torch.no_grad()
+    def fit_spec_direct(self, X_feat, Y):
+        task_idxs = self.task_class_indices[self.cur_task]
+        Y_task = Y[:, task_idxs]
+        
+        # Tạo một bản sao layer giả chỉ chứa các cột của task hiện tại để fit
+        tmp_fc = nn.Linear(self.buffer_size, len(task_idxs), bias=False).to(self.device)
+        tmp_fc.weight.data = self.fc_spec.weight.data[task_idxs, :]
+        
+        self.R_spec = self._fit_RLS_batch(X_feat, Y_task, tmp_fc, self.R_spec)
+        
+        # Gán ngược lại vào ma trận chung
+        self.fc_spec.weight.data[task_idxs, :] = tmp_fc.weight.data
+
+    @torch.no_grad()
+    def fit_uni_direct(self, X_feat, Y):
+        self.R_uni = self._fit_RLS_batch(X_feat, Y, self.fc_uni, self.R_uni)
+
+    # 2. Fit dùng Ảnh (Chậm hơn vì qua backbone)
+    @torch.no_grad()
+    def fit_spec(self, X, Y):
+        with torch.cuda.amp.autocast(enabled=False):
+            feat = self.buffer(self.backbone(X)).float()
+            self.fit_spec_direct(feat, Y)
 
     @torch.no_grad()
     def fit_uni(self, X, Y):
-        # X ở đây chưa qua backbone (vì gọi từ Min.py), cần extract feature
-        with autocast(enabled=False):
-            X = self.buffer(self.backbone(X)).float()
-            Y = Y.float()
-            # Mở rộng Y nếu cần (cho khớp số class hiện tại)
-            if Y.shape[1] < self.fc_uni.out_features:
-                tail = torch.zeros((Y.shape[0], self.fc_uni.out_features - Y.shape[1])).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
-                
-            self.R_uni = self._fit_RLS_batch(X, Y, self.fc_uni, self.R_uni)
-
-    @torch.no_grad()
-    def fit_spec(self, X, Y):
-        with autocast(enabled=False):
-            X = self.buffer(self.backbone(X)).float()
-            Y = Y.float()
-    
-            task_idxs = self.task_class_indices[self.cur_task]
-            Y_task = Y[:, task_idxs]                 # [B, C_task]
-            W_task = self.fc_spec.weight.data[task_idxs, :]  # [C_task, D]
-    
-            # --- RLS đúng công thức nhưng chỉ trên block ---
-            # K = (I + X R X^T)^-1
-            term = torch.eye(feat.shape[0], device=feat.device) + feat @ self.R_spec @ feat.T
-            K = torch.linalg.solve(term, torch.eye(term.shape[0], device=term.device))
-
-    
-            # Update R_spec (reset R trước task rồi thì OK)
-            self.R_spec = self.R_spec - (self.R_spec @ X.T @ K @ X @ self.R_spec)
-    
-            # Update chỉ block hiện tại
-            error = Y_task - X @ W_task.T            # [B, C_task]
-            delta_W = self.R_spec @ X.T @ error      # [D, C_task]
-    
-            self.fc_spec.weight.data[task_idxs, :] = W_task + delta_W.T
+        with torch.cuda.amp.autocast(enabled=False):
+            feat = self.buffer(self.backbone(X)).float()
+            self.fit_uni_direct(feat, Y)
 
     def forward_normal_fc(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
@@ -326,4 +295,5 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         for p in self.backbone.norm.parameters(): p.requires_grad = True
+
 
