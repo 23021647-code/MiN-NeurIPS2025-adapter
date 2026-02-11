@@ -358,13 +358,30 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        with torch.no_grad(), autocast('cuda'):
+        total_routing_acc = 0
+        total_batches = 0
+        task_dist_counter = None
+
+        with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
                 
-                # [MODIFIED] Logic Selection
                 if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
+                    # TRUYỀN TARGET VÀO ĐỂ DEBUG
+                    outputs = model.forward_tuna_combined(inputs, debug_targets=targets)
+                    
+                    # CỘNG DỒN LOG
+                    if 'debug_info' in outputs and outputs['debug_info']:
+                        di = outputs['debug_info']
+                        total_routing_acc += di['routing_acc']
+                        total_batches += 1
+                        
+                        # Đếm phân phối task được chọn
+                        if task_dist_counter is None:
+                            task_dist_counter = np.array(di['task_distribution'])
+                        else:
+                            task_dist_counter += np.array(di['task_distribution'])
                 else:
                     self._network.set_noise_mode(-2)
                     outputs = model(inputs)
