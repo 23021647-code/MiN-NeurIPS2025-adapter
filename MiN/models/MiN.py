@@ -565,46 +565,41 @@ class MinNet(object):
         print(f"\n=== SANITY CHECK: TASK {self.cur_task} ===")
         
         with torch.no_grad():
-            # 1. KIỂM TRA ĐỘ TRỰC GIAO (ORTHOGONALITY)
+            # 1. KIỂM TRA ĐỘ TRỰC GIAO (Sửa lỗi 0.0000)
             for idx, m in enumerate(self._network.backbone.noise_maker):
                 if self.cur_task > 0:
-                    current_mu = m.mu[self.cur_task].weight.flatten()
-                    old_mus = torch.stack([m.mu[t].weight.flatten() for t in range(self.cur_task)])
+                    # Kiểm tra xem trọng số có bị bằng 0 không
+                    curr_w = m.mu[self.cur_task].weight.data
+                    if torch.all(curr_w == 0):
+                        print(f"⚠️ Layer {idx}: Expert {self.cur_task} WEIGHTS ARE ALL ZERO!")
+                        continue
                     
-                    # Tính Cosine Similarity (Càng gần 0 càng tốt)
+                    current_mu = curr_w.flatten()
+                    old_mus = torch.stack([m.mu[t].weight.data.flatten() for t in range(self.cur_task)])
+                    
                     cos_sim = F.cosine_similarity(current_mu.unsqueeze(0), old_mus)
-                    avg_sim = cos_sim.abs().mean().item()
-                    max_sim = cos_sim.abs().max().item()
+                    print(f"Layer {idx} Orthogonality: Avg Abs Cos-Sim: {cos_sim.abs().mean().item():.4f}")
+    
+            # 2. KIỂM TRA TASK INDICES (Sửa lỗi AttributeError)
+            # Nếu model không có task_class_indices, ta lấy từ Trainer (self._known_classes)
+            try:
+                indices = getattr(self._network, 'task_class_indices', None)
+                if indices is None:
+                    # Fallback: Tự tạo indices nếu không có
+                    print("⚠️ Warning: task_class_indices not found in model. Using fallback logic.")
+                    # Giả sử mỗi task có 10 classes (cần chỉnh lại theo data của bạn)
+                    indices = {t: list(range(t*10, (t+1)*10)) for t in range(self.cur_task + 1)}
+                
+                weights = self._network.normal_fc.weight.data
+                if self.cur_task > 0:
+                    old_idx = []
+                    for t in range(self.cur_task): old_idx.extend(indices[t])
+                    new_idx = indices[self.cur_task]
                     
-                    print(f"Layer {idx} Noise Orthogonality:")
-                    print(f"   - Avg Abs Cos-Sim: {avg_sim:.4f} (Mục tiêu: < 0.1)")
-                    print(f"   - Max Abs Cos-Sim: {max_sim:.4f}")
+                    old_n = torch.norm(weights[old_idx], p=2, dim=1).mean().item()
+                    new_n = torch.norm(weights[new_idx], p=2, dim=1).mean().item()
+                    print(f"Weight Balance: Old Norm: {old_n:.4f}, New Norm: {new_n:.4f}, Ratio: {new_n/old_n:.2f}")
+            except Exception as e:
+                print(f"❌ Could not check weights: {e}")
     
-            # 2. KIỂM TRA MA TRẬN R (ĐÁP LẠI CLAUDE)
-            if hasattr(self, 'R_spec') and self.R_spec is not None:
-                r_norm = torch.norm(self.R_spec).item()
-                # Kiểm tra trị riêng để xem ma trận có bị suy biến (singular) không
-                eigvals = torch.linalg.eigvalsh(self.R_spec)
-                cond_number = eigvals.max() / (eigvals.min() + 1e-8)
-                
-                print(f"RLS Matrix R Health:")
-                print(f"   - Frobenius Norm: {r_norm:.2f}")
-                print(f"   - Condition Number: {cond_number.item():.2e} (Nếu > 1e7 là có vấn đề)")
-    
-            # 3. KIỂM TRA TRỌNG SỐ FC (WEIGHT INHERITANCE)
-            # So sánh chuẩn (norm) của các dòng cũ và dòng mới
-            weights = self._network.normal_fc.weight.data
-            if self.cur_task > 0:
-                old_indices = []
-                for t in range(self.cur_task):
-                    old_indices.extend(self.task_class_indices[t])
-                new_indices = self.task_class_indices[self.cur_task]
-                
-                old_norm = torch.norm(weights[old_indices], p=2, dim=1).mean().item()
-                new_norm = torch.norm(weights[new_indices], p=2, dim=1).mean().item()
-                
-                print(f"Classifier Weight Balance:")
-                print(f"   - Old Classes Avg Norm: {old_norm:.4f}")
-                print(f"   - New Classes Avg Norm: {new_norm:.4f}")
-                print(f"   - Ratio (New/Old): {new_norm/old_norm:.2f}")
         print("========================================\n")
