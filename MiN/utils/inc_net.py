@@ -245,7 +245,7 @@ class MiNbaseNet(nn.Module):
             spec_mag = best_task_logits.abs().mean().item()
             
             # In ra màn hình (In 1 lần mỗi batch hoặc dùng counter để in thưa)
-            if random.random() < 0.05: # In ngẫu nhiên 5% số lần để tránh nghẽn log
+            if random.random() < 1: # In ngẫu nhiên 5% số lần để tránh nghẽn log
                 print(f"\n>>> LOGIT MAGNITUDE - Uni: {uni_mag:.4f} | Spec: {spec_mag:.4f} | Ratio: {spec_mag/uni_mag:.2f}")
         # -----------------------------------------------
 
@@ -295,5 +295,6 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         for p in self.backbone.norm.parameters(): p.requires_grad = True
+
 
 
