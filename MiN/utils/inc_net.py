@@ -236,34 +236,43 @@ class MiNbaseNet(nn.Module):
                     min_entropy[mask] = entropy[mask]
                     best_task_ids[mask] = t
         with torch.no_grad():
-            # Lấy Logits của nhánh Specific (Expert tốt nhất được chọn cho mỗi ảnh)
-            # best_task_logits: [Batch, Total_Classes]
-            best_task_logits = torch.stack(saved_task_logits, dim=1)[range(batch_size), best_task_ids]
+            # Tập hợp logits của các expert được chọn cho từng ảnh
+            # Shape: [Batch, Total_Classes]
+            best_spec_logits = torch.stack(saved_task_logits, dim=1)[range(batch_size), best_task_ids]
             
-            # Tính độ lớn trung bình (Mean Absolute Value)
-            uni_mag = logits_uni.abs().mean().item()
-            spec_mag = best_task_logits.abs().mean().item()
+            # Tính Magnitude cho TỪNG ẢNH (dim=1)
+            # keepdim=True để có shape [Batch, 1], giúp nhân broadcast dễ dàng
+            mag_uni_sample = logits_uni.abs().mean(dim=1, keepdim=True)
+            mag_spec_sample = best_spec_logits.abs().mean(dim=1, keepdim=True)
             
-            # In ra màn hình (In 1 lần mỗi batch hoặc dùng counter để in thưa)
-            if random.random() < 1: # In ngẫu nhiên 5% số lần để tránh nghẽn log
-                print(f"\n>>> LOGIT MAGNITUDE - Uni: {uni_mag:.4f} | Spec: {spec_mag:.4f} | Ratio: {spec_mag/uni_mag:.2f}")
-        # -----------------------------------------------
+            # Alpha riêng cho mỗi mẫu: Alpha[i] = Mag_Uni[i] / Mag_Spec[i]
+            alpha_sample = mag_uni_sample / (mag_spec_sample + 1e-8)
+            
+            # Giới hạn Alpha trong khoảng [0.1, 1.0] để bảo vệ nhánh Uni
+            alpha_sample = torch.clamp(alpha_sample, min=0.2, max=1.0)
 
-        # 3. Injection
+            if random.random() <1:
+                # In ra trung bình batch để bạn vẫn theo dõi được xu hướng chung
+                print(f">>> Avg Dynamic Alpha: {alpha_sample.mean().item():.4f}")
+
+        # 3. Final Ensemble với Alpha riêng cho từng mẫu
         final_logits = logits_uni.clone()
         for t in range(num_tasks):
             if t in self.task_class_indices:
                 class_idxs = self.task_class_indices[t]
                 mask_t = (best_task_ids == t)
                 if mask_t.sum() > 0:
-                    expert_l = saved_task_logits[t][mask_t]
-                    cols = torch.tensor(class_idxs, device=self.device)
-                    final_logits[mask_t][:, cols] += expert_l[:, cols]
+                    # Lấy expert logits và alpha của các mẫu thuộc task t
+                    expert_l = saved_task_logits[t][mask_t] # [num_masked, Total_Classes]
+                    a_t = alpha_sample[mask_t]             # [num_masked, 1]
+                    
+                    # Chỉ cộng vào các cột của task này, có nhân scale riêng cho từng ảnh
+                    # PyTorch tự broadcast a_t vào các cột của expert_l
+                    final_logits[mask_t, class_idxs[0]:class_idxs[-1]+1] += a_t * expert_l[:, class_idxs]
 
         self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
-
     def set_noise_mode(self, mode):
         if hasattr(self.backbone, 'noise_maker'):
             for m in self.backbone.noise_maker:
@@ -295,6 +304,7 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         for p in self.backbone.norm.parameters(): p.requires_grad = True
+
 
 
 
