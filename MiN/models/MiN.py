@@ -287,6 +287,7 @@ class MinNet(object):
         self._clear_gpu()
 
     def run(self, train_loader):
+        # 1. THIẾT LẬP THÔNG SỐ THEO TASK
         if self.cur_task == 0:
             epochs = self.init_epochs
             lr = self.init_lr
@@ -296,11 +297,18 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        for param in self._network.parameters(): param.requires_grad = False
-        for param in self._network.normal_fc.parameters(): param.requires_grad = True
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
+        # 2. QUẢN LÝ GRADIENT (FREEZE/UNFREEZE)
+        for param in self._network.parameters(): 
+            param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): 
+            param.requires_grad = True
             
+        if self.cur_task == 0: 
+            self._network.init_unfreeze()
+        else: 
+            self._network.unfreeze_noise()
+            
+        # Khởi tạo Optimizer và Scheduler
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
@@ -308,55 +316,71 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
         prog_bar = tqdm(range(epochs))
+
+        # 3. VÒNG LẶP HUẤN LUYỆN
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
+            correct, total = 0, 0
+            
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
                 with autocast('cuda'):
-                    # 1. Forward và tính Cross Entropy Loss
+                    # --- PHẦN 1: CROSS ENTROPY LOSS ---
                     if self.cur_task > 0:
+                        # TUNA Logic: Ensemble dự đoán mới và tri thức cũ (frozen)
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
+                        
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits'] + logits1
-                        loss_ce = F.cross_entropy(logits2, targets.long())
+                        logits_final = outputs2['logits'] + logits1
+                        loss_ce = F.cross_entropy(logits_final, targets.long())
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        loss_ce = F.cross_entropy(outputs["logits"], targets.long())
+                        logits_final = outputs["logits"]
+                        loss_ce = F.cross_entropy(logits_final, targets.long())
 
-                    # 2. TÍNH ORTHOGONAL LOSS (Chỉ từ Task 1 trở đi)
-                    loss_orth = 0.0
+                    # --- PHẦN 2: ORTHOGONAL LOSS (CỐ ĐỊNH KHÔNG GIAN 192 CHIỀU) ---
+                    loss_orth = torch.tensor(0.0).to(self.device)
                     if self.cur_task > 0:
-                        # Duyệt qua từng layer có chứa PiNoise
                         for m in self._network.backbone.noise_maker:
-                            # mu shape: [num_tasks, 192]
-                            current_mu = m.mu[self.cur_task] 
-                            old_mus = m.mu[:self.cur_task]   # Các task cũ
+                            # Trích xuất vector mu hiện tại và các vector mu cũ
+                            current_mu = m.mu[self.cur_task] # [192]
+                            old_mus = m.mu[:self.cur_task]   # [num_old_tasks, 192]
                             
-                            # Tính tích vô hướng: (1, 192) x (192, t) -> (1, t)
-                            # Càng gần 0 càng tốt
+                            # Tính tích vô hướng để ép các hướng Expert vuông góc nhau
+                            # [num_old_tasks, 192] @ [192, 1] -> [num_old_tasks, 1]
                             dot_products = torch.matmul(old_mus, current_mu.unsqueeze(1))
                             loss_orth += torch.norm(dot_products, p=2)
 
-                    # 3. Tổng Loss với hệ số lamda (thường chọn 0.1 hoặc 0.01)
-                    lamda_orth = 0.1
+                    # --- PHẦN 3: TỔNG HỢP VÀ BACKWARD ---
+                    # lamda_orth = 0.1 giúp Expert tập trung vào các "ngách" trống trong 192 chiều
+                    lamda_orth = 0.1 
                     total_loss = loss_ce + lamda_orth * loss_orth
 
+                # Mixed Precision Step
                 self.scaler.scale(total_loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
+
+                # Thống kê kết quả
                 losses += total_loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                del inputs, targets, loss, logits_final
 
+                # Giải phóng bộ nhớ ngay lập tức
+                del inputs, targets, total_loss, loss_ce, loss_orth, logits_final
+                if self.cur_task > 0: del logits1
+
+            # Cập nhật LR và Log thông tin
             scheduler.step()
             train_acc = 100. * correct / total
-            info = "Task {} --> SGD Run: Loss {:.3f}, Acc {:.2f}".format(self.cur_task, losses/len(train_loader), train_acc)
+            info = "Task {} --> SGD Run: Loss {:.3f}, Acc {:.2f}".format(
+                self.cur_task, losses/len(train_loader), train_acc
+            )
             self.logger.info(info)
             prog_bar.set_description(info)
 
