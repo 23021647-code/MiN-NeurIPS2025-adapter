@@ -93,6 +93,7 @@ class MinNet(object):
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         del test_set
         self.analyze_entropy_accuracy(test_loader)
+        self.analyze_universal_correlation(test_loader)
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
@@ -455,3 +456,56 @@ class MinNet(object):
         plt.show() # Hiển thị ngay trong Notebook
         plt.close()
         print(f">>> Biểu đồ đã lưu tại tuna_proof_task_{self.cur_task}.png")
+    def analyze_universal_correlation(self, test_loader):
+        self._network.eval()
+        all_entropies = []
+        all_correct_flags = []
+    
+        print(">>> Analyzing Universal Branch (Mode -2) Correlation...")
+        with torch.no_grad():
+            for _, inputs, targets in tqdm(test_loader, desc="Collecting Universal Data"):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                
+                # 1. Chuyển sang Universal Mode
+                self._network.set_noise_mode(-2)
+                feat_uni = self._network.extract_feature(inputs)
+                logits_uni = self._network.fc_uni(feat_uni)['logits']
+                
+                # 2. Tính Entropy trên toàn bộ các lớp đã biết
+                prob = torch.softmax(logits_uni, dim=1)
+                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                
+                # 3. Tính Accuracy
+                predicts = torch.max(logits_uni, dim=1)[1]
+                correct = (predicts == targets).float()
+    
+                all_entropies.extend(entropy.cpu().numpy())
+                all_correct_flags.extend(correct.cpu().numpy())
+    
+        self._plot_universal_proof(all_entropies, all_correct_flags)
+    
+    def _plot_universal_proof(self, entropies, correct_flags, num_bins=10):
+        entropies = np.array(entropies)
+        correct_flags = np.array(correct_flags)
+    
+        bin_edges = np.linspace(entropies.min(), entropies.max(), num_bins + 1)
+        accuracies = []
+        avg_entropies = []
+    
+        for i in range(num_bins):
+            mask = (entropies >= bin_edges[i]) & (entropies < bin_edges[i+1])
+            if mask.any():
+                accuracies.append(correct_flags[mask].mean() * 100)
+                avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
+    
+        plt.figure(figsize=(8, 6))
+        plt.plot(accuracies, avg_entropies, marker='s', color='blue', linestyle='--', linewidth=2)
+        plt.xlabel('Accuracy (%)', fontsize=12)
+        plt.ylabel('Entropy (Universal)', fontsize=12)
+        plt.title(f'Universal Branch Analysis (Task {self.cur_task})', fontsize=14)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.gca().invert_yaxis() 
+        
+        plt.savefig(f'universal_proof_task_{self.cur_task}.png')
+        plt.close()
+        print(f">>> Biểu đồ Universal đã lưu tại universal_proof_task_{self.cur_task}.png")
